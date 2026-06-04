@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next'
 import { navigationService } from '@/services/navigation'
 import { ZapIcon, LogOutIcon } from 'lucide-react'
 import GithubIcon from '@/components/icons/GithubIcon'
+import WorkspaceSelector from '@/components/WorkspaceSelector'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
 
 interface NavigationTabProps {
@@ -75,7 +76,7 @@ export default function SiteHeader() {
 
   return (
     <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex h-10 w-full border-b px-4 backdrop-blur">
-      <div className="min-w-[200px] w-auto flex items-center">
+      <div className="min-w-[180px] w-auto flex items-center">
         <a href={webuiPrefix} className="flex items-center gap-2">
           <ZapIcon className="size-4 text-emerald-400" aria-hidden="true" />
           <span className="font-bold md:inline-block">{SiteInfo.name}</span>
@@ -110,8 +111,9 @@ export default function SiteHeader() {
         )}
       </div>
 
-      <nav className="w-[200px] flex items-center justify-end">
+      <nav className="min-w-[360px] flex items-center justify-end">
         <div className="flex items-center gap-2">
+          <WorkspaceSelector />
           {versionDisplay && (
             <TooltipProvider>
               <Tooltip>

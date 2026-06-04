@@ -66,6 +66,10 @@ interface SettingsState {
   apiKey: string | null
   setApiKey: (key: string | null) => void
 
+  // Workspace settings
+  currentWorkspaceId: string | null
+  setCurrentWorkspaceId: (workspaceId: string | null) => void
+
   // App settings
   theme: Theme
   setTheme: (theme: Theme) => void
@@ -113,6 +117,7 @@ const useSettingsStoreBase = create<SettingsState>()(
       enableHealthCheck: true,
 
       apiKey: null,
+      currentWorkspaceId: null,
 
       currentTab: 'documents',
       showFileName: false,
@@ -183,6 +188,7 @@ const useSettingsStoreBase = create<SettingsState>()(
       setEnableHealthCheck: (enable: boolean) => set({ enableHealthCheck: enable }),
 
       setApiKey: (apiKey: string | null) => set({ apiKey }),
+      setCurrentWorkspaceId: (currentWorkspaceId: string | null) => set({ currentWorkspaceId }),
 
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
@@ -238,7 +244,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 19,
+      version: 20,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -340,6 +346,9 @@ const useSettingsStoreBase = create<SettingsState>()(
           if (state.querySettings) {
             delete state.querySettings.response_type
           }
+        }
+        if (version < 20) {
+          state.currentWorkspaceId = null
         }
         return state
       }

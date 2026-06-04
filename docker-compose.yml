@@ -1,11 +1,11 @@
 services:
   lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
+    image: lightrag-local:workspace
     build:
       context: .
       dockerfile: Dockerfile
       tags:
-        - ghcr.io/hkuds/lightrag:latest
+        - lightrag-local:workspace
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
     volumes:
@@ -25,3 +25,4 @@ services:
       PROMPT_DIR: "/app/data/prompts"
       HOST: "0.0.0.0"
       PORT: "9621"
+      WORKSPACE: "${WORKSPACE:-default}"

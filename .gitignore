@@ -81,6 +81,7 @@ ignore_this.txt
 # AI Agent files
 memory-bank
 .claude/
+docs/superpowers/
 
 # Google Jules
 .jules/

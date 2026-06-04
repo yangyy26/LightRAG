@@ -5,7 +5,25 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
 import { navigationService } from '@/services/navigation'
 
+export const workspaceHeader = 'LIGHTRAG-WORKSPACE'
+
 // Types
+export type WorkspaceInfo = {
+  id: string
+  name?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type WorkspaceListResponse = {
+  workspaces: WorkspaceInfo[]
+}
+
+export type WorkspaceCreateRequest = {
+  id: string
+  name?: string | null
+}
+
 export type LightragNodeType = {
   id: string
   labels: string[]
@@ -365,6 +383,41 @@ const axiosInstance = axios.create({
   }
 })
 
+const workspaceExemptPathPrefixes = [
+  '/workspaces',
+  '/health',
+  '/auth-status',
+  '/login',
+  '/docs',
+  '/openapi.json',
+  '/redoc'
+]
+
+const normalizeRequestPath = (url?: string): string => {
+  if (!url) return '/'
+  try {
+    return new URL(url, backendBaseUrl).pathname
+  } catch {
+    return url.startsWith('/') ? url.split('?')[0] : `/${url.split('?')[0]}`
+  }
+}
+
+export const requiresWorkspaceHeader = (url?: string): boolean => {
+  const path = normalizeRequestPath(url)
+  return !workspaceExemptPathPrefixes.some((prefix) =>
+    path === prefix || path.startsWith(`${prefix}/`)
+  )
+}
+
+export const getWorkspaceHeaders = (url?: string): Record<string, string> => {
+  if (!requiresWorkspaceHeader(url)) return {}
+
+  const workspaceId = useSettingsStore.getState().currentWorkspaceId
+  if (!workspaceId) return {}
+
+  return { [workspaceHeader]: workspaceId }
+}
+
 // ========== Token Management ==========
 // Prevent multiple requests from triggering token refresh simultaneously
 let isRefreshingGuestToken = false;
@@ -415,6 +468,8 @@ const silentRefreshGuestToken = async (): Promise<string> => {
 
 // Interceptor: add api key and check authentication
 axiosInstance.interceptors.request.use((config) => {
+  config.headers = config.headers ?? {}
+
   // Skip interceptor for token refresh requests
   if (config.headers['X-Skip-Interceptor']) {
     delete config.headers['X-Skip-Interceptor'];
@@ -431,6 +486,7 @@ axiosInstance.interceptors.request.use((config) => {
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   }
+  Object.assign(config.headers, getWorkspaceHeaders(config.url))
   return config
 })
 
@@ -529,6 +585,50 @@ axiosInstance.interceptors.response.use(
 )
 
 // API methods
+type WorkspaceListPayload = WorkspaceListResponse | WorkspaceInfo[] | null | undefined
+
+const normalizeWorkspaceList = (payload: WorkspaceListPayload): WorkspaceInfo[] => {
+  if (Array.isArray(payload)) return payload
+  if (payload && Array.isArray(payload.workspaces)) return payload.workspaces
+  return []
+}
+
+const defaultWorkspaceListGet = async (): Promise<WorkspaceListPayload> => {
+  const response = await axiosInstance.get<WorkspaceListPayload>('/workspaces')
+  return response.data
+}
+
+let workspaceListGet = defaultWorkspaceListGet
+
+export const listWorkspaces = async (): Promise<WorkspaceInfo[]> => {
+  return normalizeWorkspaceList(await workspaceListGet())
+}
+
+export const __resetWorkspaceListGetForTests = (): void => {
+  workspaceListGet = defaultWorkspaceListGet
+}
+
+export const __setWorkspaceListGetForTests = (
+  get: () => Promise<WorkspaceListPayload>
+): void => {
+  workspaceListGet = get
+}
+
+export const createWorkspace = async (request: WorkspaceCreateRequest): Promise<WorkspaceInfo> => {
+  const response = await axiosInstance.post('/workspaces', request)
+  return response.data
+}
+
+export const getWorkspace = async (workspaceId: string): Promise<WorkspaceInfo> => {
+  const response = await axiosInstance.get(`/workspaces/${encodeURIComponent(workspaceId)}`)
+  return response.data
+}
+
+export const deleteWorkspace = async (workspaceId: string): Promise<WorkspaceInfo> => {
+  const response = await axiosInstance.delete(`/workspaces/${encodeURIComponent(workspaceId)}`)
+  return response.data
+}
+
 export const queryGraphs = async (
   label: string,
   maxDepth: number,
@@ -609,6 +709,7 @@ export const queryTextStream = async (
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
   }
+  Object.assign(headers, getWorkspaceHeaders('/query/stream'))
 
   try {
     const response = await fetch(`${backendBaseUrl}/query/stream`, {

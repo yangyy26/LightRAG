@@ -8,9 +8,9 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from lightrag.base import DeletionResult
+from lightrag.api.workspace import WorkspaceContext
 from lightrag.utils import logger
-from ..utils_api import get_combined_auth_dependency
-from .document_routes import check_pipeline_busy_or_raise
+from .auth import get_router_auth_dependency as _shared_router_auth_dependency
 
 
 class EntityUpdateRequest(BaseModel):
@@ -109,17 +109,68 @@ class RelationCreateRequest(BaseModel):
     )
 
 
-def create_graph_routes(rag, api_key: Optional[str] = None):
+def _get_router_auth_dependency(api_key: Optional[str]):
+    return _shared_router_auth_dependency(api_key)
+
+
+def _coerce_workspace_dependency(workspace_dependency):
+    if callable(workspace_dependency):
+        return workspace_dependency
+
+    rag = workspace_dependency
+
+    async def dependency() -> WorkspaceContext:
+        return WorkspaceContext(
+            workspace_id=getattr(rag, "workspace", ""),
+            rag=rag,
+            doc_manager=None,
+        )
+
+    return dependency
+
+
+async def check_pipeline_busy_or_raise(rag) -> None:
+    """Refuse graph mutations while the document pipeline is busy."""
+    from lightrag.exceptions import PipelineNotInitializedError
+    from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+
+    try:
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=rag.workspace
+        )
+    except PipelineNotInitializedError:
+        return
+
+    pipeline_status_lock = get_namespace_lock(
+        "pipeline_status", workspace=rag.workspace
+    )
+    async with pipeline_status_lock:
+        if pipeline_status.get("busy"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Pipeline is busy with another operation. "
+                    "Wait for the running job to finish before editing "
+                    "the knowledge graph."
+                ),
+            )
+
+
+def create_graph_routes(workspace_dependency, api_key: Optional[str] = None):
+    workspace_dependency = _coerce_workspace_dependency(workspace_dependency)
+
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
     # "Duplicate Operation ID" warnings.
     router = APIRouter(tags=["graph"])
 
-    combined_auth = get_combined_auth_dependency(api_key)
+    combined_auth = _get_router_auth_dependency(api_key)
 
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
-    async def get_graph_labels():
+    async def get_graph_labels(
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Get all graph labels
 
@@ -127,6 +178,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             List[str]: List of graph labels
         """
         try:
+            rag = context.rag
             return await rag.get_graph_labels()
         except Exception as e:
             logger.error(f"Error getting graph labels: {str(e)}")
@@ -140,6 +192,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         limit: int = Query(
             300, description="Maximum number of popular labels to return", ge=1, le=1000
         ),
+        context: WorkspaceContext = Depends(workspace_dependency),
     ):
         """
         Get popular labels by node degree (most connected entities)
@@ -151,6 +204,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             List[str]: List of popular labels sorted by degree (highest first)
         """
         try:
+            rag = context.rag
             return await rag.chunk_entity_relation_graph.get_popular_labels(limit)
         except Exception as e:
             logger.error(f"Error getting popular labels: {str(e)}")
@@ -165,6 +219,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         limit: int = Query(
             50, description="Maximum number of search results to return", ge=1, le=100
         ),
+        context: WorkspaceContext = Depends(workspace_dependency),
     ):
         """
         Search labels with fuzzy matching
@@ -177,6 +232,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             List[str]: List of matching labels sorted by relevance
         """
         try:
+            rag = context.rag
             return await rag.chunk_entity_relation_graph.search_labels(q, limit)
         except Exception as e:
             logger.error(f"Error searching labels with query '{q}': {str(e)}")
@@ -190,6 +246,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         label: str = Query(..., description="Label to get knowledge graph for"),
         max_depth: int = Query(3, description="Maximum depth of graph", ge=1),
         max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+        context: WorkspaceContext = Depends(workspace_dependency),
     ):
         """
         Retrieve a connected subgraph of nodes where the label includes the specified label.
@@ -206,6 +263,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict[str, List[str]]: Knowledge graph for label
         """
         try:
+            rag = context.rag
             # Log the label parameter to check for leading spaces
             logger.debug(
                 f"get_knowledge_graph called with label: '{label}' (length: {len(label)}, repr: {repr(label)})"
@@ -226,6 +284,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(
         name: str = Query(..., description="Entity name to check"),
+        context: WorkspaceContext = Depends(workspace_dependency),
     ):
         """
         Check if an entity with the given name exists in the knowledge graph
@@ -237,6 +296,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict[str, bool]: Dictionary with 'exists' key indicating if entity exists
         """
         try:
+            rag = context.rag
             exists = await rag.chunk_entity_relation_graph.has_node(name)
             return {"exists": exists}
         except Exception as e:
@@ -247,7 +307,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/entity/edit", dependencies=[Depends(combined_auth)])
-    async def update_entity(request: EntityUpdateRequest):
+    async def update_entity(
+        request: EntityUpdateRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Update an entity's properties in the knowledge graph
 
@@ -382,6 +445,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             result = await rag.aedit_entity(
                 entity_name=request.entity_name,
@@ -440,7 +504,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/relation/edit", dependencies=[Depends(combined_auth)])
-    async def update_relation(request: RelationUpdateRequest):
+    async def update_relation(
+        request: RelationUpdateRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """Update a relation's properties in the knowledge graph
 
         Args:
@@ -450,6 +517,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict: Updated relation information
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             result = await rag.aedit_relation(
                 source_entity=request.source_id,
@@ -478,7 +546,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/entity/create", dependencies=[Depends(combined_auth)])
-    async def create_entity(request: EntityCreateRequest):
+    async def create_entity(
+        request: EntityCreateRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Create a new entity in the knowledge graph
 
@@ -523,6 +594,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             # Use the proper acreate_entity method which handles:
             # - Graph lock for concurrency
@@ -554,7 +626,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/relation/create", dependencies=[Depends(combined_auth)])
-    async def create_relation(request: RelationCreateRequest):
+    async def create_relation(
+        request: RelationCreateRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Create a new relationship between two entities in the knowledge graph
 
@@ -611,6 +686,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             # Use the proper acreate_relation method which handles:
             # - Graph lock for concurrency
@@ -646,7 +722,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             )
 
     @router.post("/graph/entities/merge", dependencies=[Depends(combined_auth)])
-    async def merge_entities(request: EntityMergeRequest):
+    async def merge_entities(
+        request: EntityMergeRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Merge multiple entities into a single entity, preserving all relationships
 
@@ -703,6 +782,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             - This operation cannot be undone, so verify entity names before merging
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             result = await rag.amerge_entities(
                 source_entities=request.entities_to_change,
@@ -734,7 +814,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_entity(request: DeleteEntityRequest):
+    async def delete_entity(
+        request: DeleteEntityRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Delete an entity and all its relationships from the knowledge graph.
 
@@ -748,6 +831,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             HTTPException: If the entity is not found (404) or an error occurs (500).
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             result = await rag.adelete_by_entity(entity_name=request.entity_name)
             if result.status == "not_found":
@@ -770,7 +854,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_relation(request: DeleteRelationRequest):
+    async def delete_relation(
+        request: DeleteRelationRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Delete a relationship between two entities from the knowledge graph.
 
@@ -784,6 +871,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             HTTPException: If the relation is not found (404) or an error occurs (500).
         """
         try:
+            rag = context.rag
             await check_pipeline_busy_or_raise(rag)
             result = await rag.adelete_by_relation(
                 source_entity=request.source_entity,

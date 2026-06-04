@@ -6,9 +6,10 @@ import json
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
-from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.workspace import WorkspaceContext
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
+from .auth import get_router_auth_dependency as _shared_router_auth_dependency
 
 
 class QueryRequest(BaseModel):
@@ -188,14 +189,38 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def _get_router_auth_dependency(api_key: Optional[str]):
+    return _shared_router_auth_dependency(api_key)
+
+
+def _coerce_workspace_dependency(workspace_dependency):
+    if callable(workspace_dependency):
+        return workspace_dependency
+
+    rag = workspace_dependency
+
+    async def dependency() -> WorkspaceContext:
+        return WorkspaceContext(
+            workspace_id=getattr(rag, "workspace", ""),
+            rag=rag,
+            doc_manager=None,
+        )
+
+    return dependency
+
+
+def create_query_routes(
+    workspace_dependency, api_key: Optional[str] = None, top_k: int = 60
+):
+    workspace_dependency = _coerce_workspace_dependency(workspace_dependency)
+
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
     # "Duplicate Operation ID" warnings.
     router = APIRouter(tags=["query"])
 
-    combined_auth = get_combined_auth_dependency(api_key)
+    combined_auth = _get_router_auth_dependency(api_key)
 
     @router.post(
         "/query",
@@ -326,7 +351,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(
+        request: QueryRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -406,6 +434,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
+            rag = context.rag
             param = request.to_query_params(
                 False
             )  # Ensure stream=False for non-streaming endpoint
@@ -536,7 +565,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(
+        request: QueryRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -664,6 +696,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             Use streaming mode for real-time interfaces and non-streaming for batch processing.
         """
         try:
+            rag = context.rag
             # Use the stream parameter from the request, defaulting to True if not specified
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
@@ -1039,7 +1072,10 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(
+        request: QueryRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 
@@ -1143,6 +1179,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             as structured data analysis typically requires source attribution.
         """
         try:
+            rag = context.rag
             param = request.to_query_params(False)  # No streaming for data endpoint
             response = await rag.aquery_data(request.query, param=param)
 

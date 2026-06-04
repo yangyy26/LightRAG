@@ -59,6 +59,12 @@ from lightrag.parser.external.mineru.cache import MinerUParserOptions
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.workspace_routes import create_workspace_routes
+from lightrag.api.workspace import (
+    WorkspaceManager,
+    WorkspaceRegistry,
+    make_workspace_dependency,
+)
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -853,9 +859,6 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
-    # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
@@ -863,20 +866,13 @@ def create_app(args):
         app.state.background_tasks = set()
 
         try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
-
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
-
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
+            # Clean up database connections for all loaded workspaces
+            await workspace_manager.shutdown()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1981,11 +1977,10 @@ def create_app(args):
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
+    def create_workspace_rag(workspace: str) -> LightRAG:
         rag = LightRAG(
             working_dir=args.working_dir,
-            workspace=args.workspace,
+            workspace=workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
@@ -2042,28 +2037,49 @@ def create_app(args):
                 for spec in ROLES
             },
         )
+        rag.register_role_llm_builder(
+            lambda role, meta: (
+                create_role_llm_func(role, meta),
+                create_role_llm_model_kwargs(role, meta),
+            )
+        )
+        return rag
+
+    workspace_registry = WorkspaceRegistry(args.working_dir)
+    workspace_manager = WorkspaceManager(
+        registry=workspace_registry,
+        working_dir=args.working_dir,
+        input_dir=args.input_dir,
+        rag_factory=create_workspace_rag,
+        document_manager_cls=DocumentManager,
+        default_workspace=args.workspace,
+    )
+    workspace_dependency = make_workspace_dependency(workspace_manager)
+
+    # Build one uninitialized config instance for status display and role config logging.
+    try:
+        rag = create_workspace_rag(args.workspace)
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
 
     _log_role_provider_options(rag)
 
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
-        )
-    )
-
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
-    app.include_router(create_document_routes(rag, doc_manager, api_key))
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_workspace_routes(workspace_manager, api_key))
+    app.include_router(create_document_routes(workspace_dependency, api_key=api_key))
+    app.include_router(create_query_routes(workspace_dependency, api_key, args.top_k))
+    app.include_router(create_graph_routes(workspace_dependency, api_key))
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    ollama_api = OllamaAPI(
+        workspace_dependency,
+        top_k=args.top_k,
+        api_key=api_key,
+        ollama_server_infos=ollama_server_infos,
+    )
     app.include_router(ollama_api.router, prefix="/api")
 
     # Custom Swagger UI endpoint for offline support

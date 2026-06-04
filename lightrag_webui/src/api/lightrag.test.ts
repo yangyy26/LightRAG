@@ -44,6 +44,47 @@ beforeAll(async () => {
 
 afterEach(() => {
   apiModule.__resetPaginatedDocumentRequestsForTests()
+  apiModule.__resetWorkspaceListGetForTests()
+})
+
+describe('workspace headers', () => {
+  afterEach(async () => {
+    const { useSettingsStore } = await import('@/stores/settings')
+    useSettingsStore.getState().setCurrentWorkspaceId(null)
+    localStorage.clear()
+  })
+
+  test('requires workspace for business API paths only', () => {
+    expect(apiModule.requiresWorkspaceHeader('/query')).toBe(true)
+    expect(apiModule.requiresWorkspaceHeader('/documents')).toBe(true)
+    expect(apiModule.requiresWorkspaceHeader('/graph/label/list')).toBe(true)
+
+    expect(apiModule.requiresWorkspaceHeader('/workspaces')).toBe(false)
+    expect(apiModule.requiresWorkspaceHeader('/workspaces/project-a')).toBe(false)
+    expect(apiModule.requiresWorkspaceHeader('/health')).toBe(false)
+    expect(apiModule.requiresWorkspaceHeader('/auth-status')).toBe(false)
+    expect(apiModule.requiresWorkspaceHeader('/login')).toBe(false)
+  })
+
+  test('builds LIGHTRAG-WORKSPACE header from selected workspace', async () => {
+    const { useSettingsStore } = await import('@/stores/settings')
+    expect(apiModule.getWorkspaceHeaders('/query')).toEqual({})
+
+    useSettingsStore.getState().setCurrentWorkspaceId('project-a')
+
+    expect(apiModule.getWorkspaceHeaders('/query')).toEqual({
+      [apiModule.workspaceHeader]: 'project-a'
+    })
+    expect(apiModule.getWorkspaceHeaders('/workspaces')).toEqual({})
+  })
+})
+
+describe('workspace list', () => {
+  test('normalizes missing workspace payload to an empty list', async () => {
+    apiModule.__setWorkspaceListGetForTests(async () => ({}))
+
+    await expect(apiModule.listWorkspaces()).resolves.toEqual([])
+  })
 })
 
 describe('getDocumentsPaginated', () => {

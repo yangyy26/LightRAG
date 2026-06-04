@@ -22,6 +22,8 @@ function App() {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
   const currentTab = useSettingsStore.use.currentTab()
+  const currentWorkspaceId = useSettingsStore.use.currentWorkspaceId()
+  const workspaceKey = currentWorkspaceId ?? 'default'
   const [apiKeyAlertOpen, setApiKeyAlertOpen] = useState(false)
   const [initializing, setInitializing] = useState(true) // Add initializing state
   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
@@ -207,13 +209,13 @@ function App() {
               <SiteHeader />
               <div className="relative grow">
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
-                  <DocumentManager />
+                  <DocumentManager key={workspaceKey} />
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <GraphViewer />
+                  <GraphViewer key={workspaceKey} />
                 </TabsContent>
                 <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <RetrievalTesting />
+                  <RetrievalTesting key={workspaceKey} />
                 </TabsContent>
                 <TabsContent value="api" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <ApiSite />

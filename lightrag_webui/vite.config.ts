@@ -8,6 +8,7 @@ import tailwindcss from '@tailwindcss/vite'
 // loading vite.config.ts. Bun resolves tsconfig paths natively, masking the
 // issue, but Node does not.
 import { normalizeApiPrefix, normalizeWebuiPrefix } from './src/lib/pathPrefix'
+import { buildDevProxyConfig } from './src/lib/viteProxy'
 
 /**
  * Inject `<script>window.__LIGHTRAG_CONFIG__ = ...</script>` into index.html.
@@ -43,12 +44,7 @@ function lightragRuntimeConfigPlugin(env: Record<string, string>): Plugin {
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, process.cwd(), '')
-
-  // Dev-only: prefix every proxied endpoint with the simulated site
-  // prefix so e.g. `/site01/documents/...` is forwarded to the backend
-  // running with LIGHTRAG_API_PREFIX=/site01.
-  const devApiPrefix = normalizeApiPrefix(env.VITE_DEV_API_PREFIX)
+  const env = loadEnv(mode, __dirname, '')
 
   return {
     plugins: [react(), tailwindcss(), lightragRuntimeConfigPlugin(env)],
@@ -83,18 +79,9 @@ export default defineConfig(({ mode }) => {
       }
     },
     server: {
-      proxy: env.VITE_API_PROXY === 'true' && env.VITE_API_ENDPOINTS ?
-        Object.fromEntries(
-          env.VITE_API_ENDPOINTS.split(',').map(endpoint => [
-            devApiPrefix + endpoint,
-            {
-              target: env.VITE_BACKEND_URL || 'http://localhost:9621',
-              changeOrigin: true
-              // No rewrite: the backend already understands its own prefix
-              // via FastAPI's root_path, so forward the path verbatim.
-            }
-          ])
-        ) : {}
+      // No rewrite: the backend already understands its own prefix
+      // via FastAPI's root_path, so forward the path verbatim.
+      proxy: buildDevProxyConfig(env)
     }
   }
 })
