@@ -45,6 +45,16 @@ from lightrag.exceptions import (
     IndexFlushError,
 )
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+from lightrag.knowledge_hierarchy import (
+    build_chunk_results_from_resource_graph,
+    build_resource_knowledge_hierarchy,
+    cleanup_legacy_hierarchy_duplicates,
+    make_resource_root_id,
+    persist_resource_knowledge_hierarchy,
+    HIERARCHY_STATUS_FAILED,
+    HIERARCHY_STATUS_PROCESSING,
+    HIERARCHY_STATUS_SUCCESS,
+)
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.parser.routing import (
     resolve_file_parser_directives,
@@ -215,6 +225,334 @@ class _PipelineMixin:
     shared methods ``self._insert_done`` / ``self._process_extract_entities``
     which remain in the main class and are resolved through MRO.
     """
+
+    def _track_knowledge_hierarchy_task(
+        self,
+        task: asyncio.Task,
+        *,
+        doc_id: str,
+        file_path: str,
+    ) -> None:
+        tasks = getattr(self, "_knowledge_hierarchy_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._knowledge_hierarchy_tasks = tasks
+        tasks.add(task)
+
+        def _finalize(done_task: asyncio.Task) -> None:
+            tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Knowledge hierarchy background task cancelled for `%s` (%s)",
+                    file_path,
+                    doc_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Knowledge hierarchy background task failed for `%s` (%s)",
+                    file_path,
+                    doc_id,
+                )
+
+        task.add_done_callback(_finalize)
+
+    async def _schedule_knowledge_hierarchy_build(
+        self,
+        *,
+        doc_id: str,
+        file_path: str,
+        chunk_results: list,
+    ) -> asyncio.Task | None:
+        if not self.enable_knowledge_hierarchy:
+            return None
+        await self._set_knowledge_hierarchy_status(
+            doc_id=doc_id,
+            status=HIERARCHY_STATUS_PROCESSING,
+            root_id=make_resource_root_id(doc_id),
+        )
+        task = asyncio.create_task(
+            self._maybe_build_knowledge_hierarchy(
+                doc_id=doc_id,
+                file_path=file_path,
+                chunk_results=chunk_results,
+                set_processing_status=False,
+            )
+        )
+        self._track_knowledge_hierarchy_task(
+            task,
+            doc_id=doc_id,
+            file_path=file_path,
+        )
+        return task
+
+    async def _maybe_build_knowledge_hierarchy(
+        self,
+        *,
+        doc_id: str,
+        file_path: str,
+        chunk_results: list,
+        set_processing_status: bool = True,
+    ) -> None:
+        if not self.enable_knowledge_hierarchy:
+            return
+        if set_processing_status:
+            await self._set_knowledge_hierarchy_status(
+                doc_id=doc_id,
+                status=HIERARCHY_STATUS_PROCESSING,
+                root_id=make_resource_root_id(doc_id),
+            )
+        await self._set_hierarchy_pipeline_progress(
+            status="processing",
+            doc_id=doc_id,
+            file_path=file_path,
+            message=f"Knowledge hierarchy started for `{file_path}`",
+        )
+        try:
+            global_config = self._build_global_config()
+            chunk_results = await self._augment_hierarchy_chunk_results_from_graph(
+                doc_id=doc_id,
+                file_path=file_path,
+                chunk_results=chunk_results,
+            )
+            await self._set_hierarchy_pipeline_progress(
+                status="processing",
+                doc_id=doc_id,
+                file_path=file_path,
+                message=f"Building knowledge hierarchy for `{file_path}`",
+            )
+            grounding_text = ""
+            try:
+                full_doc = await self.full_docs.get_by_id(doc_id)
+                if isinstance(full_doc, dict):
+                    grounding_text = str(full_doc.get("content") or "")
+            except Exception as exc:
+                logger.debug(
+                    "Failed to load hierarchy grounding text for `%s`: %s",
+                    file_path,
+                    exc,
+                )
+            hierarchy = await build_resource_knowledge_hierarchy(
+                doc_id=doc_id,
+                file_path=file_path,
+                chunk_results=chunk_results,
+                global_config=global_config,
+                llm_response_cache=getattr(self, "llm_response_cache", None),
+                grounding_text=grounding_text,
+            )
+            if hierarchy is None:
+                error = (
+                    "No hierarchy was generated. Check whether the document "
+                    "has extracted entities matching the hierarchy candidate "
+                    "types and whether the hierarchy LLM is configured."
+                )
+                await self._set_knowledge_hierarchy_status(
+                    doc_id=doc_id,
+                    status=HIERARCHY_STATUS_FAILED,
+                    root_id=make_resource_root_id(doc_id),
+                    error=error,
+                )
+                await self._set_hierarchy_pipeline_progress(
+                    status="failed",
+                    doc_id=doc_id,
+                    file_path=file_path,
+                    message=f"Knowledge hierarchy failed for `{file_path}`: {error}",
+                )
+                return
+
+            await self._set_hierarchy_pipeline_progress(
+                status="processing",
+                doc_id=doc_id,
+                file_path=file_path,
+                message=(
+                    f"Persisting knowledge hierarchy for `{file_path}`: "
+                    f"edges={len(hierarchy.edges)}"
+                ),
+            )
+            await cleanup_legacy_hierarchy_duplicates(
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+            )
+            persisted = await persist_resource_knowledge_hierarchy(
+                hierarchy,
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+            )
+            if not persisted:
+                error = (
+                    "Knowledge hierarchy could not be persisted because no "
+                    "valid hierarchy edges matched existing graph nodes."
+                )
+                await self._set_knowledge_hierarchy_status(
+                    doc_id=doc_id,
+                    status=HIERARCHY_STATUS_FAILED,
+                    root_id=hierarchy.root.entity_id,
+                    error=error,
+                )
+                await self._set_hierarchy_pipeline_progress(
+                    status="failed",
+                    doc_id=doc_id,
+                    file_path=file_path,
+                    message=f"Knowledge hierarchy failed for `{file_path}`: {error}",
+                )
+                return
+            await self._insert_done()
+            await self._set_knowledge_hierarchy_status(
+                doc_id=doc_id,
+                status=HIERARCHY_STATUS_SUCCESS,
+                root_id=hierarchy.root.entity_id,
+                stats={
+                    "hierarchy_edge_count": len(hierarchy.edges),
+                    "hierarchy_root_edge_count": sum(
+                        1 for src, _tgt, _data in hierarchy.edges
+                        if src == hierarchy.root.entity_id
+                    ),
+                    "hierarchy_non_root_edge_count": sum(
+                        1 for src, _tgt, _data in hierarchy.edges
+                        if src != hierarchy.root.entity_id
+                    ),
+                },
+            )
+            await self._set_hierarchy_pipeline_progress(
+                status="success",
+                doc_id=doc_id,
+                file_path=file_path,
+                message=f"Knowledge hierarchy completed for `{file_path}`",
+            )
+        except Exception as hierarchy_error:
+            error_message = str(hierarchy_error).strip()
+            if not error_message:
+                error_message = hierarchy_error.__class__.__name__
+            logger.exception(
+                "Knowledge hierarchy generation failed for `%s`: %s",
+                file_path,
+                error_message,
+            )
+            await self._set_knowledge_hierarchy_status(
+                doc_id=doc_id,
+                status=HIERARCHY_STATUS_FAILED,
+                root_id=make_resource_root_id(doc_id),
+                error=error_message,
+            )
+            await self._set_hierarchy_pipeline_progress(
+                status="failed",
+                doc_id=doc_id,
+                file_path=file_path,
+                message=f"Knowledge hierarchy failed for `{file_path}`: {error_message}",
+            )
+
+    async def _augment_hierarchy_chunk_results_from_graph(
+        self,
+        *,
+        doc_id: str,
+        file_path: str,
+        chunk_results: list,
+    ) -> list:
+        try:
+            status_doc = await self.doc_status.get_by_id(doc_id)
+            chunk_ids = list(doc_status_field(status_doc, "chunks_list", []) or [])
+            graph_results = await build_chunk_results_from_resource_graph(
+                self.chunk_entity_relation_graph,
+                file_path=file_path,
+                chunk_ids=chunk_ids,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to augment hierarchy candidates from graph for `%s`: %s",
+                file_path,
+                exc,
+            )
+            return chunk_results
+
+        if not graph_results:
+            return chunk_results
+        return list(chunk_results) + list(graph_results)
+
+    async def _set_hierarchy_pipeline_progress(
+        self,
+        *,
+        status: str,
+        doc_id: str,
+        file_path: str,
+        message: str,
+    ) -> None:
+        try:
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=getattr(self, "workspace", None)
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=getattr(self, "workspace", None)
+            )
+        except Exception:
+            return
+
+        async with pipeline_status_lock:
+            history = pipeline_status.setdefault("hierarchy_history_messages", [])
+            if not hasattr(history, "append"):
+                history = []
+                pipeline_status["hierarchy_history_messages"] = history
+            if status == "processing":
+                pipeline_status["hierarchy_busy"] = True
+                pipeline_status["hierarchy_total"] = max(
+                    int(pipeline_status.get("hierarchy_total", 0) or 0),
+                    int(pipeline_status.get("hierarchy_done", 0) or 0)
+                    + int(pipeline_status.get("hierarchy_failed", 0) or 0)
+                    + 1,
+                )
+            else:
+                pipeline_status["hierarchy_busy"] = False
+                if status == "success":
+                    pipeline_status["hierarchy_done"] = (
+                        int(pipeline_status.get("hierarchy_done", 0) or 0) + 1
+                    )
+                elif status == "failed":
+                    pipeline_status["hierarchy_failed"] = (
+                        int(pipeline_status.get("hierarchy_failed", 0) or 0) + 1
+                    )
+            pipeline_status["hierarchy_status"] = status
+            pipeline_status["hierarchy_current_doc"] = doc_id
+            pipeline_status["hierarchy_current_file"] = file_path
+            pipeline_status["hierarchy_latest_message"] = message
+            history.append(message)
+
+    async def _set_knowledge_hierarchy_status(
+        self,
+        *,
+        doc_id: str,
+        status: str,
+        root_id: str,
+        error: str | None = None,
+        stats: dict[str, Any] | None = None,
+    ) -> None:
+        status_doc = await self.doc_status.get_by_id(doc_id)
+        if not status_doc:
+            return
+        metadata = dict(doc_status_field(status_doc, "metadata", {}) or {})
+        metadata["hierarchy_status"] = status
+        metadata["hierarchy_root_id"] = root_id
+        metadata["hierarchy_updated_at"] = datetime.now(timezone.utc).isoformat()
+        if error:
+            metadata["hierarchy_error"] = error
+        else:
+            metadata.pop("hierarchy_error", None)
+        if stats:
+            metadata.update(stats)
+        payload = {
+            "status": doc_status_field(status_doc, "status", DocStatus.PROCESSED),
+            "content_summary": doc_status_field(status_doc, "content_summary", ""),
+            "content_length": doc_status_field(status_doc, "content_length", 0),
+            "created_at": doc_status_field(status_doc, "created_at", ""),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "file_path": doc_status_field(status_doc, "file_path", ""),
+            "track_id": doc_status_field(status_doc, "track_id", ""),
+            "content_hash": doc_status_field(status_doc, "content_hash", None),
+            "chunks_count": doc_status_field(status_doc, "chunks_count", 0),
+            "chunks_list": doc_status_field(status_doc, "chunks_list", []),
+            "error_msg": doc_status_field(status_doc, "error_msg", None),
+            "metadata": metadata,
+        }
+        await self.doc_status.upsert({doc_id: payload})
 
     # ============================================================
     # Public document ingestion API (entry points)
@@ -2505,7 +2843,6 @@ class _PipelineMixin:
                             total_files=ctx.total_files,
                             file_path=file_path,
                         )
-
                     # If another in-flight document already triggered an abort
                     # (e.g. a storage flush error set cancellation_requested),
                     # do not mark PROCESSED or re-run _insert_done here: the
@@ -2534,6 +2871,13 @@ class _PipelineMixin:
                     )
 
                     await self._insert_done()
+
+                    if not doc_process_opts.skip_kg:
+                        await self._schedule_knowledge_hierarchy_build(
+                            doc_id=doc_id,
+                            file_path=file_path,
+                            chunk_results=chunk_results,
+                        )
 
                     async with ctx.pipeline_status_lock:
                         log_message = (

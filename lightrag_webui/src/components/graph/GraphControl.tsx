@@ -297,7 +297,9 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
           return { ...data, hidden: false, labelColor, color: edgeColor }
         }
 
-        const newData = { ...data, hidden: false, labelColor, color: edgeColor }
+        const hierarchyEdgeColor = isDarkTheme ? '#34d399' : '#059669'
+        const baseEdgeColor = data.edgeType === 'hierarchy' ? hierarchyEdgeColor : edgeColor
+        const newData = { ...data, hidden: false, labelColor, color: baseEdgeColor }
 
         if (!disableHoverEffect) {
           const _focusedNode = focusedNode || selectedNode
@@ -319,7 +321,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
               }
             } catch (error) {
               console.error('Error in edgeReducer:', error);
-              return { ...data, hidden: false, labelColor, color: edgeColor }
+              return { ...data, hidden: false, labelColor, color: baseEdgeColor }
             }
           } else {
             const _selectedEdge = selectedEdge && graph.hasEdge(selectedEdge) ? selectedEdge : null;

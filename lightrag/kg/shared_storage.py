@@ -1279,12 +1279,24 @@ async def initialize_pipeline_status(workspace: str | None = None):
     )
 
     async with get_internal_lock():
+        # Create shared list objects for history messages
+        history_messages = _manager.list() if _is_multiprocess else []
+        hierarchy_history_messages = _manager.list() if _is_multiprocess else []
         # Check if already initialized by checking for required fields
         if "busy" in pipeline_namespace:
+            pipeline_namespace.setdefault("hierarchy_busy", False)
+            pipeline_namespace.setdefault("hierarchy_status", "")
+            pipeline_namespace.setdefault("hierarchy_total", 0)
+            pipeline_namespace.setdefault("hierarchy_done", 0)
+            pipeline_namespace.setdefault("hierarchy_failed", 0)
+            pipeline_namespace.setdefault("hierarchy_current_doc", "")
+            pipeline_namespace.setdefault("hierarchy_current_file", "")
+            pipeline_namespace.setdefault("hierarchy_latest_message", "")
+            pipeline_namespace.setdefault(
+                "hierarchy_history_messages", hierarchy_history_messages
+            )
             return
 
-        # Create a shared list object for history_messages
-        history_messages = _manager.list() if _is_multiprocess else []
         pipeline_namespace.update(
             {
                 "autoscanned": False,  # Auto-scan started
@@ -1322,6 +1334,15 @@ async def initialize_pipeline_status(workspace: str | None = None):
                 "request_pending": False,  # Flag for pending request for processing
                 "latest_message": "",  # Latest message from pipeline processing
                 "history_messages": history_messages,  # 使用共享列表对象
+                "hierarchy_busy": False,
+                "hierarchy_status": "",
+                "hierarchy_total": 0,
+                "hierarchy_done": 0,
+                "hierarchy_failed": 0,
+                "hierarchy_current_doc": "",
+                "hierarchy_current_file": "",
+                "hierarchy_latest_message": "",
+                "hierarchy_history_messages": hierarchy_history_messages,
             }
         )
 

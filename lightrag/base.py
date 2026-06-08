@@ -127,6 +127,23 @@ class QueryParam:
     )
     """Maximum total tokens budget for the entire query context (entities + relations + chunks + system prompt)."""
 
+    enable_hierarchy_context: bool = (
+        os.getenv("ENABLE_HIERARCHY_CONTEXT", "false").lower() == "true"
+    )
+    """If True, expands query context with resource-local knowledge hierarchy data."""
+
+    hierarchy_parent_depth: int = int(os.getenv("HIERARCHY_PARENT_DEPTH", "2"))
+    """Number of hierarchy ancestors to include for matched knowledge points."""
+
+    hierarchy_child_depth: int = int(os.getenv("HIERARCHY_CHILD_DEPTH", "1"))
+    """Number of child levels to include for matched knowledge points."""
+
+    hierarchy_sibling_limit: int = int(os.getenv("HIERARCHY_SIBLING_LIMIT", "5"))
+    """Maximum number of sibling knowledge points to include per matched node."""
+
+    max_hierarchy_tokens: int = int(os.getenv("MAX_HIERARCHY_TOKENS", "2000"))
+    """Maximum tokens allocated to hierarchy context."""
+
     hl_keywords: list[str] = field(default_factory=list)
     """List of high-level keywords to prioritize in retrieval."""
 

@@ -45,6 +45,7 @@ from lightrag.parser.routing import (
     resolve_file_parser_directives,
 )
 from lightrag.utils import (
+    compute_mdhash_id,
     generate_track_id,
     move_file_to_parsed_dir,
 )
@@ -502,6 +503,9 @@ class InsertResponse(BaseModel):
             takes that value any more.
         message: Detailed message describing the operation result
         track_id: Tracking ID for monitoring processing status
+        doc_id: Document ID used by doc_status and /documents/paginated
+        root_id: Resource hierarchy root ID for /graph/hierarchy
+        file_path: Canonical stored file path when the response refers to one file
     """
 
     status: Literal["success", "partial_success", "failure"] = Field(
@@ -509,6 +513,18 @@ class InsertResponse(BaseModel):
     )
     message: str = Field(description="Message describing the operation result")
     track_id: str = Field(description="Tracking ID for monitoring processing status")
+    doc_id: Optional[str] = Field(
+        default=None,
+        description="Document ID returned by /documents/paginated for single-file uploads",
+    )
+    root_id: Optional[str] = Field(
+        default=None,
+        description="Hierarchy root ID, formatted as resource:<doc_id>",
+    )
+    file_path: Optional[str] = Field(
+        default=None,
+        description="Canonical stored file path for single-file uploads",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -516,6 +532,9 @@ class InsertResponse(BaseModel):
                 "status": "success",
                 "message": "File 'document.pdf' uploaded successfully. Processing will continue in background.",
                 "track_id": "upload_20250729_170612_abc123",
+                "doc_id": "doc-0123456789abcdef",
+                "root_id": "resource:doc-0123456789abcdef",
+                "file_path": "document.pdf",
             }
         }
     )
@@ -3306,6 +3325,9 @@ def create_document_routes(
                 )
 
             track_id = generate_track_id("upload")
+            upload_file_path = normalize_file_path(safe_filename)
+            upload_doc_id = compute_mdhash_id(upload_file_path, prefix="doc-")
+            upload_root_id = f"resource:{upload_doc_id}"
 
             # Bg task: enqueue + trigger processing, then release the slot.
             # ``pipeline_index_file`` does both: it calls
@@ -3330,6 +3352,9 @@ def create_document_routes(
                 status="success",
                 message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
                 track_id=track_id,
+                doc_id=upload_doc_id,
+                root_id=upload_root_id,
+                file_path=upload_file_path,
             )
 
         except HTTPException:
@@ -3885,6 +3910,10 @@ def create_document_routes(
                 else:
                     # No truncation needed, return all messages
                     status_dict["history_messages"] = history_list
+
+            if "hierarchy_history_messages" in status_dict:
+                hierarchy_history_list = list(status_dict["hierarchy_history_messages"])
+                status_dict["hierarchy_history_messages"] = hierarchy_history_list[-1000:]
 
             # Ensure job_start is properly formatted as a string with timezone information
             if "job_start" in status_dict and status_dict["job_start"]:

@@ -109,6 +109,10 @@ class RelationCreateRequest(BaseModel):
     )
 
 
+class HierarchyRetryRequest(BaseModel):
+    doc_id: str = Field(..., description="Document ID whose hierarchy should be rebuilt")
+
+
 def _get_router_auth_dependency(api_key: Optional[str]):
     return _shared_router_auth_dependency(api_key)
 
@@ -279,6 +283,87 @@ def create_graph_routes(workspace_dependency, api_key: Optional[str] = None):
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error getting knowledge graph: {str(e)}"
+            )
+
+    @router.get("/graph/hierarchy", dependencies=[Depends(combined_auth)])
+    async def get_resource_hierarchy(
+        root_id: str = Query(
+            ..., description="Resource root id, e.g. resource:<doc_id>"
+        ),
+        max_depth: int = Query(20, description="Maximum hierarchy depth", ge=1, le=50),
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        try:
+            rag = context.rag
+            tree = await rag.get_knowledge_hierarchy(
+                root_id=root_id, max_depth=max_depth
+            )
+            if tree is None:
+                raise HTTPException(status_code=404, detail="Hierarchy root not found")
+            return tree
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error getting hierarchy for root '{root_id}': {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error getting hierarchy: {str(e)}",
+            )
+
+    @router.get("/graph/hierarchies", dependencies=[Depends(combined_auth)])
+    async def get_workspace_hierarchies(
+        max_depth: int = Query(20, description="Maximum hierarchy depth", ge=1, le=50),
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        try:
+            rag = context.rag
+            trees = await rag.get_knowledge_hierarchies(max_depth=max_depth)
+            return {"items": trees, "count": len(trees)}
+        except Exception as e:
+            logger.error(f"Error getting workspace hierarchies: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error getting workspace hierarchies: {str(e)}",
+            )
+
+    @router.post("/graph/hierarchy/retry", dependencies=[Depends(combined_auth)])
+    async def retry_resource_hierarchy(
+        request: HierarchyRetryRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        try:
+            rag = context.rag
+            return await rag.schedule_knowledge_hierarchy_retry(request.doc_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Document not found")
+        except Exception as e:
+            logger.error(
+                f"Error retrying hierarchy for doc '{request.doc_id}': {str(e)}"
+            )
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error retrying hierarchy: {str(e)}",
+            )
+
+    @router.post("/graph/hierarchy/cleanup-legacy", dependencies=[Depends(combined_auth)])
+    async def cleanup_legacy_resource_hierarchy(
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        try:
+            rag = context.rag
+            await check_pipeline_busy_or_raise(rag)
+            return await rag.cleanup_legacy_knowledge_hierarchy()
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error cleaning legacy hierarchy nodes: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error cleaning legacy hierarchy nodes: {str(e)}",
             )
 
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])

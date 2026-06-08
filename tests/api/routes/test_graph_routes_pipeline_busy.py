@@ -8,6 +8,7 @@ with HTTP 409 while the document pipeline is busy:
 - POST /graph/entity/create        (graph_routes)
 - POST /graph/relation/create      (graph_routes)
 - POST /graph/entities/merge       (graph_routes)
+- POST /graph/hierarchy/cleanup-legacy (graph_routes)
 - DELETE /graph/entity/delete      (graph_routes)
 - DELETE /graph/relation/delete    (graph_routes)
 
@@ -79,6 +80,9 @@ def _make_mock_rag() -> SimpleNamespace:
         acreate_entity=AsyncMock(return_value={"entity_name": "Alice"}),
         acreate_relation=AsyncMock(return_value={"src_id": "a", "tgt_id": "b"}),
         amerge_entities=AsyncMock(return_value={"merged_entity": "Alice"}),
+        cleanup_legacy_knowledge_hierarchy=AsyncMock(
+            return_value={"removed": [], "count": 0}
+        ),
         adelete_by_entity=AsyncMock(
             return_value=SimpleNamespace(
                 status="success", message="deleted", doc_id="ignored"
@@ -92,7 +96,16 @@ def _make_mock_rag() -> SimpleNamespace:
     )
 
 
-def _build_client(rag: SimpleNamespace) -> TestClient:
+def _build_client(rag: SimpleNamespace, monkeypatch) -> TestClient:
+    async def allow_auth():
+        return None
+
+    monkeypatch.setattr(
+        _graph_routes, "_get_router_auth_dependency", lambda _api_key: allow_auth
+    )
+    monkeypatch.setattr(
+        _document_routes, "_get_router_auth_dependency", lambda _api_key: allow_auth
+    )
     app = FastAPI()
     app.include_router(create_graph_routes(rag, api_key=_API_KEY))
     app.include_router(create_document_routes(rag, SimpleNamespace(), api_key=_API_KEY))
@@ -170,6 +183,12 @@ _ENDPOINTS = [
         id="merge_entities",
     ),
     pytest.param(
+        "POST",
+        "/graph/hierarchy/cleanup-legacy",
+        None,
+        id="cleanup_legacy_hierarchy",
+    ),
+    pytest.param(
         "DELETE",
         "/graph/entity/delete",
         {"entity_name": "Alice"},
@@ -187,7 +206,7 @@ _ENDPOINTS = [
 @pytest.mark.parametrize("method, path, body", _ENDPOINTS)
 def test_endpoint_refuses_with_409_when_pipeline_busy(method, path, body, monkeypatch):
     rag = _make_mock_rag()
-    client = _build_client(rag)
+    client = _build_client(rag, monkeypatch)
     _patch_guard(monkeypatch, _force_busy_guard)
 
     response = client.request(method, path, json=body, headers=_HEADERS)
@@ -202,6 +221,7 @@ def test_endpoint_refuses_with_409_when_pipeline_busy(method, path, body, monkey
         "acreate_entity",
         "acreate_relation",
         "amerge_entities",
+        "cleanup_legacy_knowledge_hierarchy",
         "adelete_by_entity",
         "adelete_by_relation",
     ):
@@ -211,7 +231,7 @@ def test_endpoint_refuses_with_409_when_pipeline_busy(method, path, body, monkey
 def test_endpoint_passes_through_when_pipeline_idle(monkeypatch):
     """Sanity check: with an idle guard, the request reaches ``rag.aedit_entity``."""
     rag = _make_mock_rag()
-    client = _build_client(rag)
+    client = _build_client(rag, monkeypatch)
     _patch_guard(monkeypatch, _noop_guard)
 
     response = client.post(

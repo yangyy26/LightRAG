@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useSettingsStore } from '@/stores/settings'
+import { useGraphStore } from '@/stores/graph'
 import Button from '@/components/ui/Button'
 import { cn } from '@/lib/utils'
 import {
@@ -31,6 +32,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   scanNewDocuments,
   getDocumentsPaginatedWithTimeout,
+  retryGraphHierarchy,
   DocsStatusesResponse,
   DocStatus,
   DocStatusResponse,
@@ -42,7 +44,7 @@ import { toast } from 'sonner'
 import { useBackendState } from '@/stores/state'
 import { copyToClipboard } from '@/utils/clipboard'
 
-import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon } from 'lucide-react'
+import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon, NetworkIcon } from 'lucide-react'
 import PipelineStatusDialog from '@/components/documents/PipelineStatusDialog'
 import {
   getStatusBucket,
@@ -212,6 +214,37 @@ const hasDocumentDetails = (doc: DocStatusResponse): boolean => {
     (doc.metadata && Object.keys(doc.metadata).length > 0)
   )
 }
+
+const getHierarchyStatus = (doc: DocStatusResponse): string | undefined => {
+  const status = doc.metadata?.hierarchy_status
+  return typeof status === 'string' ? status : undefined
+}
+
+const getHierarchyStatusClassName = (status: string | undefined): string => {
+  switch (status) {
+    case 'success':
+      return 'text-green-600'
+    case 'processing':
+      return 'text-blue-600'
+    case 'failed':
+      return 'text-red-600'
+    default:
+      return 'text-gray-500'
+  }
+}
+
+const canRetryHierarchy = (status: string | undefined): boolean =>
+  status === 'success' || status === 'failed'
+
+const getHierarchyRetryButtonKey = (status: string | undefined): string =>
+  status === 'success'
+    ? 'documentPanel.documentManager.regenerateHierarchyButton'
+    : 'documentPanel.documentManager.retryHierarchyButton'
+
+const getHierarchyRetryTooltipKey = (status: string | undefined): string =>
+  status === 'success'
+    ? 'documentPanel.documentManager.regenerateHierarchyTooltip'
+    : 'documentPanel.documentManager.retryHierarchyTooltip'
 
 const formatDocumentDetails = (doc: DocStatusResponse): string => {
   const details: string[] = []
@@ -404,6 +437,7 @@ export default function DocumentManager() {
   const setShowFileName = useSettingsStore.use.setShowFileName()
   const documentsPageSize = useSettingsStore.use.documentsPageSize()
   const setDocumentsPageSize = useSettingsStore.use.setDocumentsPageSize()
+  const setCurrentTab = useSettingsStore.use.setCurrentTab()
 
   // New pagination state
   const [currentPageDocs, setCurrentPageDocs] = useState<DocStatusResponse[]>([])
@@ -444,6 +478,7 @@ export default function DocumentManager() {
 
   // State for document selection
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([])
+  const [retryingHierarchyDocIds, setRetryingHierarchyDocIds] = useState<string[]>([])
   const isSelectionMode = selectedDocIds.length > 0
 
   // Add refs to track previous pipelineActive state and current interval
@@ -476,6 +511,16 @@ export default function DocumentManager() {
     lastFailureTime: null as number | null,
     nextRetryTime: null as number | null
   });
+
+  const handleViewHierarchyGraph = useCallback((doc: DocStatusResponse) => {
+    const hierarchyRootId = `resource:${doc.id}`
+    useGraphStore.getState().setGraphDataFetchAttempted(false)
+    useGraphStore.getState().setLastSuccessfulQueryLabel('')
+    useGraphStore.getState().clearSelection()
+    useSettingsStore.getState().setQueryLabel(hierarchyRootId)
+    useGraphStore.getState().incrementGraphDataVersion()
+    setCurrentTab('knowledge-graph')
+  }, [setCurrentTab])
 
 
   // Handle checkbox change for individual documents
@@ -1028,6 +1073,25 @@ export default function DocumentManager() {
       fire()
     }, 2000 - gap)
   }, [handleIntelligentRefresh]);
+
+  const handleRetryHierarchy = useCallback(async (doc: DocStatusResponse) => {
+    setRetryingHierarchyDocIds(prev => [...prev, doc.id])
+    try {
+      const result = await retryGraphHierarchy(doc.id)
+      if (result.status === 'success') {
+        toast.success(t('documentPanel.documentManager.hierarchyRetrySuccess'))
+      } else if (result.status === 'processing') {
+        toast.success(t('documentPanel.documentManager.hierarchyRetryStarted'))
+      } else {
+        toast.error(result.error || t('documentPanel.documentManager.hierarchyRetryFailed'))
+      }
+      refreshDocumentsThrottled()
+    } catch (err) {
+      toast.error(t('documentPanel.documentManager.hierarchyRetryFailedWithError', { error: errorMessage(err) }))
+    } finally {
+      setRetryingHierarchyDocIds(prev => prev.filter(id => id !== doc.id))
+    }
+  }, [t, refreshDocumentsThrottled])
 
   // Activity probe: short exponential-backoff burst of /health checks fired
   // after scan/upload triggers. Stops as soon as pipelineActive flips true so
@@ -1597,6 +1661,7 @@ export default function DocumentManager() {
                           </TableHead>
                           <TableHead>{t('documentPanel.documentManager.columns.summary')}</TableHead>
                           <TableHead>{t('documentPanel.documentManager.columns.status')}</TableHead>
+                          <TableHead>{t('documentPanel.documentManager.columns.hierarchyStatus')}</TableHead>
                           <TableHead>{t('documentPanel.documentManager.columns.length')}</TableHead>
                           <TableHead>{t('documentPanel.documentManager.columns.chunks')}</TableHead>
                           <TableHead
@@ -1625,7 +1690,7 @@ export default function DocumentManager() {
                               )}
                             </div>
                           </TableHead>
-                          <TableHead className="w-16 text-center">
+                          <TableHead className="w-24 text-center">
                             {t('documentPanel.documentManager.columns.select')}
                           </TableHead>
                         </TableRow>
@@ -1687,6 +1752,56 @@ export default function DocumentManager() {
                                 {hasDocumentDetails(doc) && <DocumentStatusDetailsDialog doc={doc} />}
                               </div>
                             </TableCell>
+                            <TableCell>
+                              {(() => {
+                                const hierarchyStatus = getHierarchyStatus(doc)
+                                const retrying = retryingHierarchyDocIds.includes(doc.id)
+                                const hierarchyError = typeof doc.metadata?.hierarchy_error === 'string'
+                                  ? doc.metadata.hierarchy_error
+                                  : undefined
+                                return (
+                                  <div className="flex max-w-[220px] flex-col gap-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className={getHierarchyStatusClassName(hierarchyStatus)}>
+                                        {t(`documentPanel.documentManager.hierarchyStatus.${hierarchyStatus || 'none'}`)}
+                                      </span>
+                                      {canRetryHierarchy(hierarchyStatus) && (
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => handleRetryHierarchy(doc)}
+                                          disabled={retrying}
+                                          tooltip={
+                                            hierarchyStatus === 'failed' && hierarchyError
+                                              ? hierarchyError
+                                              : t(getHierarchyRetryTooltipKey(hierarchyStatus))
+                                          }
+                                          className={cn(
+                                            'h-7 px-2',
+                                            hierarchyStatus === 'success' ? 'text-green-700' : 'text-amber-700'
+                                          )}
+                                        >
+                                          <RefreshCwIcon className={cn('mr-1 h-3.5 w-3.5', retrying && 'animate-spin')} />
+                                          {t(getHierarchyRetryButtonKey(hierarchyStatus))}
+                                        </Button>
+                                      )}
+                                    </div>
+                                    {hierarchyStatus === 'failed' && hierarchyError && (
+                                      <Tooltip>
+                                        <TooltipTrigger asChild>
+                                          <div className="truncate text-xs text-red-500">
+                                            {hierarchyError}
+                                          </div>
+                                        </TooltipTrigger>
+                                        <TooltipContent side="top" className="max-w-lg">
+                                          {hierarchyError}
+                                        </TooltipContent>
+                                      </Tooltip>
+                                    )}
+                                  </div>
+                                )
+                              })()}
+                            </TableCell>
                             <TableCell>{doc.content_length ?? '-'}</TableCell>
                             <TableCell>{doc.chunks_count ?? '-'}</TableCell>
                             <TableCell className="truncate">
@@ -1696,12 +1811,36 @@ export default function DocumentManager() {
                               {new Date(doc.updated_at).toLocaleString()}
                             </TableCell>
                             <TableCell className="text-center">
-                              <Checkbox
-                                checked={selectedDocIds.includes(doc.id)}
-                                onCheckedChange={(checked) => handleDocumentSelect(doc.id, checked === true)}
-                                // disabled={doc.status !== 'processed'}
-                                className="mx-auto"
-                              />
+                              <div className="flex items-center justify-center gap-1">
+                                {(() => {
+                                  const hierarchyStatus = getHierarchyStatus(doc)
+                                  const hierarchyUnavailable = hierarchyStatus === 'failed' || hierarchyStatus === 'processing'
+                                  return (
+                                    <>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        onClick={() => handleViewHierarchyGraph(doc)}
+                                        disabled={doc.status !== 'processed' || hierarchyUnavailable}
+                                        tooltip={
+                                          hierarchyStatus === 'failed'
+                                            ? t('documentPanel.documentManager.hierarchyFailedTooltip')
+                                            : t('documentPanel.documentManager.viewHierarchyGraphTooltip')
+                                        }
+                                        className="h-8 w-8"
+                                      >
+                                        <NetworkIcon className="h-4 w-4" />
+                                      </Button>
+                                    </>
+                                  )
+                                })()}
+                                <Checkbox
+                                  checked={selectedDocIds.includes(doc.id)}
+                                  onCheckedChange={(checked) => handleDocumentSelect(doc.id, checked === true)}
+                                  // disabled={doc.status !== 'processed'}
+                                  className="mx-auto"
+                                />
+                              </div>
                             </TableCell>
                           </TableRow>
                         ))}

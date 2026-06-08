@@ -55,6 +55,7 @@ from lightrag.base import (
     QueryContextResult,
 )
 from lightrag.chunk_schema import strip_internal_multimodal_markup_for_extraction
+from lightrag.knowledge_hierarchy import build_hierarchy_context
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
@@ -4680,6 +4681,7 @@ async def _build_context_str(
     relations_context: list[dict],
     merged_chunks: list[dict],
     query: str,
+    knowledge_graph_inst: BaseGraphStorage,
     query_param: QueryParam,
     global_config: dict[str, str],
     chunk_tracking: dict = None,
@@ -4731,11 +4733,20 @@ async def _build_context_str(
     relations_str = "\n".join(
         json.dumps(relation, ensure_ascii=False) for relation in relations_context
     )
+    hierarchy_context_str = await build_hierarchy_context(
+        matched_entities=list(entity_id_to_original.values())
+        if entity_id_to_original
+        else [],
+        knowledge_graph_inst=knowledge_graph_inst,
+        query_param=query_param,
+        tokenizer=tokenizer,
+    )
 
     # Calculate preliminary kg context tokens
     pre_kg_context = kg_context_template.format(
         entities_str=entities_str,
         relations_str=relations_str,
+        hierarchy_context_str=hierarchy_context_str,
         text_chunks_str="",
         reference_list_str="",
     )
@@ -4834,6 +4845,7 @@ async def _build_context_str(
     result = kg_context_template.format(
         entities_str=entities_str,
         relations_str=relations_str,
+        hierarchy_context_str=hierarchy_context_str,
         text_chunks_str=text_units_str,
         reference_list_str=reference_list_str,
     )
@@ -4936,6 +4948,7 @@ async def _build_query_context(
         relations_context=truncation_result["relations_context"],
         merged_chunks=merged_chunks,
         query=query,
+        knowledge_graph_inst=knowledge_graph_inst,
         query_param=query_param,
         global_config=text_chunks_db.global_config,
         chunk_tracking=search_result["chunk_tracking"],
@@ -4997,7 +5010,7 @@ async def _get_node_data(
     if not len(results):
         return [], []
 
-    # Extract all entity IDs from your results list
+    # Entity VDB ids are storage ids; graph node ids are the original entity names.
     node_ids = [r["entity_name"] for r in results]
 
     # Call the batch node retrieval and degree functions concurrently.
@@ -5017,10 +5030,11 @@ async def _get_node_data(
         {
             **n,
             "entity_name": k["entity_name"],
+            "entity_id": node_id,
             "rank": d,
             "created_at": k.get("created_at"),
         }
-        for k, n, d in zip(results, node_datas, node_degrees)
+        for k, node_id, n, d in zip(results, node_ids, node_datas, node_degrees)
         if n is not None
     ]
 

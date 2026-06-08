@@ -1,6 +1,7 @@
 import importlib
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ _base = importlib.import_module("lightrag.base")
 sys.argv = _original_argv
 
 create_document_routes = _document_routes.create_document_routes
+compute_mdhash_id = importlib.import_module("lightrag.utils").compute_mdhash_id
 DocProcessingStatus = _base.DocProcessingStatus
 DocStatus = _base.DocStatus
 DocStatusStorage = _base.DocStatusStorage
@@ -63,15 +65,37 @@ class _FakeDocStatusStorage:
     async def get_all_status_counts(self):
         return {"processed": 1, "parsing": 1, "analyzing": 1}
 
+    async def get_doc_by_file_basename(self, basename):
+        for doc_id, doc in self.docs.items():
+            if doc.file_path == basename:
+                return doc_id, doc
+        return None
+
+
+class _FakeDocManager:
+    def __init__(self, input_dir):
+        self.input_dir = input_dir
+        self.supported_extensions = [".txt", ".pdf"]
+
+    def is_supported_file(self, filename):
+        return str(filename).lower().endswith((".txt", ".pdf"))
+
+
+def _include_document_routes(app, rag, doc_manager):
+    original_argv = sys.argv[:]
+    sys.argv = [sys.argv[0]]
+    try:
+        app.include_router(create_document_routes(rag, doc_manager, api_key="test-key"))
+    finally:
+        sys.argv = original_argv
+
 
 _fake_doc_status = _FakeDocStatusStorage()
 _app = FastAPI()
-_app.include_router(
-    create_document_routes(
-        SimpleNamespace(doc_status=_fake_doc_status),
-        SimpleNamespace(),
-        api_key="test-key",
-    )
+_include_document_routes(
+    _app,
+    SimpleNamespace(doc_status=_fake_doc_status),
+    SimpleNamespace(),
 )
 _client = TestClient(_app)
 _headers = {"X-API-Key": "test-key"}
@@ -117,3 +141,35 @@ def test_documents_paginated_status_filters_override_status_filter():
         "parsing-doc",
         "analyzing-doc",
     ]
+
+
+def test_upload_returns_document_id_and_hierarchy_root(monkeypatch, tmp_path):
+    doc_status = _FakeDocStatusStorage()
+    rag = SimpleNamespace(doc_status=doc_status, workspace="course_a")
+    doc_manager = _FakeDocManager(tmp_path)
+
+    monkeypatch.setattr(_document_routes, "_reserve_enqueue_slot", AsyncMock())
+    monkeypatch.setattr(_document_routes, "_release_enqueue_slot", AsyncMock())
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", AsyncMock())
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_global_args",
+        lambda: SimpleNamespace(max_upload_size=None),
+    )
+
+    app = FastAPI()
+    _include_document_routes(app, rag, doc_manager)
+    client = TestClient(app)
+
+    response = client.post(
+        "/documents/upload",
+        headers=_headers,
+        files={"file": ("course-outline.[native].txt", b"hello")},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    expected_doc_id = compute_mdhash_id("course-outline.txt", prefix="doc-")
+    assert payload["doc_id"] == expected_doc_id
+    assert payload["root_id"] == f"resource:{expected_doc_id}"
+    assert payload["file_path"] == "course-outline.txt"

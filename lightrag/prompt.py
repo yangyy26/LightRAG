@@ -596,6 +596,12 @@ Knowledge Graph Data (Relationship):
 {relations_str}
 ```
 
+Knowledge Hierarchy Context:
+
+```text
+{hierarchy_context_str}
+```
+
 Document Chunks (Each entry has a reference_id refer to the `Reference Document List`):
 
 ```json

@@ -524,6 +524,77 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             )
         )
     )
+
+    enable_knowledge_hierarchy: bool = field(
+        default_factory=lambda: get_env_value(
+            "ENABLE_KNOWLEDGE_HIERARCHY", True, bool
+        )
+    )
+    """If True, builds a resource-local knowledge point hierarchy for new uploads."""
+
+    hierarchy_max_depth: int = field(
+        default_factory=lambda: get_env_value("HIERARCHY_MAX_DEPTH", 5, int)
+    )
+    """Maximum depth for generated resource-local knowledge hierarchies."""
+
+    hierarchy_max_candidates: int = field(
+        default_factory=lambda: get_env_value("HIERARCHY_MAX_CANDIDATES", 80, int)
+    )
+    """Deprecated fallback for hierarchy_batch_size; no longer caps candidates."""
+
+    hierarchy_batch_size: int = field(
+        default_factory=lambda: get_env_value(
+            "HIERARCHY_BATCH_SIZE",
+            get_env_value("HIERARCHY_MAX_CANDIDATES", 80, int),
+            int,
+        )
+    )
+    """Unresolved child candidates sent to one hierarchy parent-assignment LLM call."""
+
+    hierarchy_max_rounds: int = field(
+        default_factory=lambda: get_env_value("HIERARCHY_MAX_ROUNDS", 2, int)
+    )
+    """Maximum LLM parent-assignment rounds for unresolved hierarchy candidates."""
+
+    hierarchy_parent_candidate_limit: int = field(
+        default_factory=lambda: get_env_value(
+            "HIERARCHY_PARENT_CANDIDATE_LIMIT", 40, int
+        )
+    )
+    """Maximum parent choices included in a hierarchy parent-assignment prompt."""
+
+    hierarchy_min_parent_confidence: float = field(
+        default_factory=lambda: get_env_value(
+            "HIERARCHY_MIN_PARENT_CONFIDENCE", 0.6, float
+        )
+    )
+    """Minimum confidence required to accept an LLM parent assignment."""
+
+    hierarchy_max_parallel_batches: int = field(
+        default_factory=lambda: get_env_value("HIERARCHY_MAX_PARALLEL_BATCHES", 3, int)
+    )
+    """Reserved maximum concurrent hierarchy parent-assignment LLM batches."""
+
+    hierarchy_build_timeout: float = field(
+        default_factory=lambda: get_env_value("HIERARCHY_BUILD_TIMEOUT", 180.0, float)
+    )
+    """Best-effort timeout for hierarchy generation; timeout never fails ingestion."""
+
+    hierarchy_candidate_entity_types: list[str] = field(
+        default_factory=lambda: [
+            item.strip()
+            for item in os.getenv(
+                "HIERARCHY_CANDIDATE_ENTITY_TYPES",
+                "",
+            ).split(",")
+            if item.strip()
+        ]
+    )
+    """Entity types eligible for hierarchy organization; empty means all entity types."""
+
+    hierarchy_llm_model_func: Callable[..., Any] | None = field(default=None)
+    """Optional LLM function for hierarchy organization; falls back to extraction LLM."""
+
     max_parallel_parse_mineru: int = field(
         default=int(
             os.getenv(
@@ -867,6 +938,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         self._replace_addon_params(addon_params, mark_dirty=False)
         self._apply_chunk_size_overlay()
         self._refresh_addon_params_cache()
+        self.hierarchy_candidate_entity_types = [
+            item.strip().lower()
+            for item in self.hierarchy_candidate_entity_types
+            if isinstance(item, str) and item.strip()
+        ]
 
         # Handle deprecated parameters
         if self.log_level is not None:
@@ -1055,7 +1131,18 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"entity_name", "source_id", "content", "file_path"},
+            meta_fields={
+                "entity_name",
+                "entity_type",
+                "description",
+                "source_id",
+                "content",
+                "file_path",
+                "hierarchy_kind",
+                "root_id",
+                "parent_id",
+                "level",
+            },
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
@@ -1237,6 +1324,44 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         text = await self.chunk_entity_relation_graph.get_all_labels()
         return text
 
+    async def _resolve_hierarchy_root_label(self, node_label: str) -> str:
+        if not isinstance(node_label, str) or not node_label.strip():
+            return node_label
+
+        label = node_label.strip()
+        candidate_ids = [label]
+        if not label.startswith("resource:"):
+            candidate_ids.append(f"resource:{label}")
+
+        for candidate_id in candidate_ids:
+            node = await self.chunk_entity_relation_graph.get_node(candidate_id)
+            if node and node.get("hierarchy_kind") == "root":
+                return candidate_id
+
+        try:
+            all_nodes = await self.chunk_entity_relation_graph.get_all_nodes()
+        except Exception as exc:
+            logger.debug(
+                "Failed to scan hierarchy roots for label `%s`: %s", label, exc
+            )
+            return label
+
+        for node in all_nodes:
+            if node.get("hierarchy_kind") != "root":
+                continue
+            root_id = node.get("entity_id") or node.get("id") or node.get("root_id")
+            if not root_id:
+                continue
+            matches = {
+                str(node.get("doc_id") or ""),
+                str(node.get("entity_name") or ""),
+                str(node.get("file_path") or ""),
+            }
+            if label in matches:
+                return str(root_id)
+
+        return label
+
     async def get_knowledge_graph(
         self,
         node_label: str,
@@ -1260,9 +1385,101 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             # Limit max_nodes to not exceed self.max_graph_nodes
             max_nodes = min(max_nodes, self.max_graph_nodes)
 
-        return await self.chunk_entity_relation_graph.get_knowledge_graph(
+        node_label = await self._resolve_hierarchy_root_label(node_label)
+        graph = await self.chunk_entity_relation_graph.get_knowledge_graph(
             node_label, max_depth, max_nodes
         )
+        if hasattr(graph, "edges"):
+            graph.edges = [
+                edge
+                for edge in graph.edges
+                if edge.properties.get("edge_type") != "hierarchy"
+            ]
+        return graph
+
+    async def get_knowledge_hierarchy(self, root_id: str, max_depth: int = 20):
+        from lightrag.knowledge_hierarchy import get_hierarchy_tree
+
+        root_id = await self._resolve_hierarchy_root_label(root_id)
+        return await get_hierarchy_tree(
+            self.chunk_entity_relation_graph,
+            root_id=root_id,
+            max_depth=max_depth,
+        )
+
+    async def get_knowledge_hierarchies(self, max_depth: int = 20):
+        from lightrag.knowledge_hierarchy import get_all_hierarchy_trees
+
+        return await get_all_hierarchy_trees(
+            self.chunk_entity_relation_graph,
+            max_depth=max_depth,
+        )
+
+    async def cleanup_legacy_knowledge_hierarchy(self) -> dict[str, Any]:
+        from lightrag.knowledge_hierarchy import cleanup_legacy_hierarchy_duplicates
+
+        removed = await cleanup_legacy_hierarchy_duplicates(
+            self.chunk_entity_relation_graph,
+            self.entities_vdb,
+        )
+        if removed:
+            await self._insert_done()
+        return {"removed": removed, "count": len(removed)}
+
+    async def retry_knowledge_hierarchy(self, doc_id: str) -> dict[str, Any]:
+        from lightrag.knowledge_hierarchy import build_chunk_results_from_resource_graph
+        from lightrag.utils_pipeline import doc_status_field
+
+        status_doc = await self.doc_status.get_by_id(doc_id)
+        if not status_doc:
+            raise KeyError(f"Document not found: {doc_id}")
+        file_path = str(doc_status_field(status_doc, "file_path", "") or "")
+        chunk_results = await build_chunk_results_from_resource_graph(
+            self.chunk_entity_relation_graph,
+            file_path=file_path,
+            chunk_ids=list(doc_status_field(status_doc, "chunks_list", []) or []),
+        )
+        await self._maybe_build_knowledge_hierarchy(
+            doc_id=doc_id,
+            file_path=file_path,
+            chunk_results=chunk_results,
+        )
+        refreshed = await self.doc_status.get_by_id(doc_id)
+        metadata = doc_status_field(refreshed, "metadata", {}) if refreshed else {}
+        return {
+            "doc_id": doc_id,
+            "root_id": f"resource:{doc_id}",
+            "status": (metadata or {}).get("hierarchy_status"),
+            "error": (metadata or {}).get("hierarchy_error"),
+        }
+
+    async def schedule_knowledge_hierarchy_retry(self, doc_id: str) -> dict[str, Any]:
+        from lightrag.knowledge_hierarchy import (
+            build_chunk_results_from_resource_graph,
+            make_resource_root_id,
+        )
+        from lightrag.utils_pipeline import doc_status_field
+
+        status_doc = await self.doc_status.get_by_id(doc_id)
+        if not status_doc:
+            raise KeyError(f"Document not found: {doc_id}")
+        file_path = str(doc_status_field(status_doc, "file_path", "") or "")
+        chunk_results = await build_chunk_results_from_resource_graph(
+            self.chunk_entity_relation_graph,
+            file_path=file_path,
+            chunk_ids=list(doc_status_field(status_doc, "chunks_list", []) or []),
+        )
+        await self._schedule_knowledge_hierarchy_build(
+            doc_id=doc_id,
+            file_path=file_path,
+            chunk_results=chunk_results,
+        )
+        return {
+            "doc_id": doc_id,
+            "root_id": make_resource_root_id(doc_id),
+            "status": "processing",
+            "error": None,
+        }
 
     def insert(
         self,
@@ -2124,6 +2341,11 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             conversation_history=param.conversation_history,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
+            enable_hierarchy_context=param.enable_hierarchy_context,
+            hierarchy_parent_depth=param.hierarchy_parent_depth,
+            hierarchy_child_depth=param.hierarchy_child_depth,
+            hierarchy_sibling_limit=param.hierarchy_sibling_limit,
+            max_hierarchy_tokens=param.max_hierarchy_tokens,
         )
 
         query_result = None

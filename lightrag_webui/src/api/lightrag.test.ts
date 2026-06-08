@@ -45,6 +45,8 @@ beforeAll(async () => {
 afterEach(() => {
   apiModule.__resetPaginatedDocumentRequestsForTests()
   apiModule.__resetWorkspaceListGetForTests()
+  apiModule.__resetHierarchyGetForTests()
+  apiModule.__resetGraphsGetForTests()
 })
 
 describe('workspace headers', () => {
@@ -84,6 +86,81 @@ describe('workspace list', () => {
     apiModule.__setWorkspaceListGetForTests(async () => ({}))
 
     await expect(apiModule.listWorkspaces()).resolves.toEqual([])
+  })
+})
+
+describe('queryGraphHierarchy', () => {
+  test('converts hierarchy tree payload to graph nodes and edges', async () => {
+    let requestedUrl = ''
+    apiModule.__setHierarchyGetForTests(async (url) => {
+      requestedUrl = url
+      return {
+        data: {
+          entity_id: 'resource:doc-a',
+          entity_name: 'trees.pdf',
+          root_id: 'resource:doc-a',
+          hierarchy_kind: 'root',
+          children: [
+            {
+              entity_id: 'Tree',
+              entity_name: 'Tree',
+              root_id: 'resource:doc-a',
+              parent_id: 'resource:doc-a',
+              children: [
+                {
+                  entity_id: 'Binary Tree',
+                  entity_name: 'Binary Tree',
+                  root_id: 'resource:doc-a',
+                  parent_id: 'Tree',
+                  children: []
+                }
+              ]
+            }
+          ]
+        }
+      }
+    })
+
+    const graph = await apiModule.queryGraphHierarchy('resource:doc-a', 5)
+
+    expect(requestedUrl).toBe('/graph/hierarchy?root_id=resource%3Adoc-a&max_depth=5')
+    expect(graph.nodes.map((node) => node.id)).toEqual([
+      'resource:doc-a',
+      'Tree',
+      'Binary Tree'
+    ])
+    expect(graph.edges.map((edge) => [edge.source, edge.target])).toEqual([
+      ['resource:doc-a', 'Tree'],
+      ['Tree', 'Binary Tree']
+    ])
+    expect(graph.edges[0].properties.edge_type).toBe('hierarchy')
+  })
+
+  test('falls back to normal graph when hierarchy is not found', async () => {
+    let hierarchyRequested = ''
+    let fallbackRequest: [string, number, number] | null = null
+    apiModule.__setHierarchyGetForTests(async (url) => {
+      hierarchyRequested = url
+      const error = new Error('Hierarchy root not found') as Error & {
+        response?: { status: number }
+      }
+      error.response = { status: 404 }
+      throw error
+    })
+    apiModule.__setGraphsGetForTests(async (label, maxDepth, maxNodes) => {
+      fallbackRequest = [label, maxDepth, maxNodes]
+      return {
+        nodes: [],
+        edges: []
+      }
+    })
+
+    const graph = await apiModule.queryResourceGraph('Not A Resource', 3, 1000)
+
+    expect(hierarchyRequested).toBe('/graph/hierarchy?root_id=Not%20A%20Resource&max_depth=3')
+    expect(fallbackRequest).toEqual(['Not A Resource', 3, 1000])
+    expect(graph.nodes).toBeDefined()
+    expect(graph.edges).toBeDefined()
   })
 })
 

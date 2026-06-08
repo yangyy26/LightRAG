@@ -202,7 +202,7 @@ function App() {
           // Main content after initialization
           <main className="flex h-screen w-screen overflow-hidden">
             <Tabs
-              defaultValue={currentTab}
+              value={currentTab}
               className="!m-0 flex grow flex-col !p-0 overflow-hidden"
               onValueChange={handleTabChange}
             >

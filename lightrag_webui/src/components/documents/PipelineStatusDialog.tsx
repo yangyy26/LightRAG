@@ -52,7 +52,7 @@ export default function PipelineStatusDialog({
     if (!container || isUserScrolled) return
 
     container.scrollTop = container.scrollHeight
-  }, [status?.history_messages, isUserScrolled])
+  }, [status?.history_messages, status?.hierarchy_history_messages, isUserScrolled])
 
   const handleScroll = () => {
     const container = historyRef.current
@@ -223,6 +223,29 @@ export default function PipelineStatusDialog({
             </div>
           </div>
 
+          {/* Knowledge Hierarchy Status */}
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{t('documentPanel.pipelineStatus.hierarchyTitle')}</span>
+                <span className={`h-2 w-2 rounded-full ${status?.hierarchy_busy ? 'bg-green-500' : 'bg-gray-300'}`} />
+              </div>
+              <span className="text-sm">
+                {t('documentPanel.pipelineStatus.hierarchyProgress')}: {
+                  status
+                    ? `${status.hierarchy_done ?? 0}/${status.hierarchy_total ?? 0}, ${t('documentPanel.pipelineStatus.hierarchyFailed')}: ${status.hierarchy_failed ?? 0}`
+                    : '-'
+                }
+              </span>
+            </div>
+            <div className="text-sm">
+              {t('documentPanel.pipelineStatus.hierarchyCurrentFile')}: {status?.hierarchy_current_file || '-'}
+            </div>
+            <div className="text-sm break-all">
+              {t('documentPanel.pipelineStatus.hierarchyLatestMessage')}: {status?.hierarchy_latest_message || '-'}
+            </div>
+          </div>
+
           {/* History Messages */}
           <div className="space-y-2">
             <div className="text-sm font-medium">{t('documentPanel.pipelineStatus.pipelineMessages')}:</div>
@@ -233,6 +256,18 @@ export default function PipelineStatusDialog({
             >
               {status?.history_messages?.length ? (
                 status.history_messages.map((msg, idx) => (
+                  <div key={idx} className="whitespace-pre-wrap break-all">{msg}</div>
+                ))
+              ) : '-'}
+            </div>
+          </div>
+
+          {/* Hierarchy Messages */}
+          <div className="space-y-2">
+            <div className="text-sm font-medium">{t('documentPanel.pipelineStatus.hierarchyMessages')}:</div>
+            <div className="font-mono text-xs rounded-md bg-zinc-800 text-zinc-100 p-3 overflow-y-auto overflow-x-hidden min-h-[4.5em] max-h-[24vh]">
+              {status?.hierarchy_history_messages?.length ? (
+                status.hierarchy_history_messages.map((msg, idx) => (
                   <div key={idx} className="whitespace-pre-wrap break-all">{msg}</div>
                 ))
               ) : '-'}

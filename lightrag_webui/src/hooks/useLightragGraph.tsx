@@ -5,7 +5,7 @@ import { errorMessage } from '@/lib/utils'
 import * as Constants from '@/lib/constants'
 import { useGraphStore, RawGraph, RawNodeType, RawEdgeType } from '@/stores/graph'
 import { toast } from 'sonner'
-import { queryGraphs } from '@/api/lightrag'
+import { queryGraphs, queryResourceGraph } from '@/api/lightrag'
 import { useBackendState } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -102,7 +102,9 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
 
   try {
     console.log(`Fetching graph label: ${queryLabel}, depth: ${maxDepth}, nodes: ${maxNodes}`);
-    rawData = await queryGraphs(queryLabel, maxDepth, maxNodes);
+    rawData = queryLabel === '*'
+      ? await queryGraphs(queryLabel, maxDepth, maxNodes)
+      : await queryResourceGraph(queryLabel, maxDepth, maxNodes);
   } catch (e) {
     useBackendState.getState().setErrorMessage(errorMessage(e), 'Query Graphs Error!');
     return null;
@@ -182,6 +184,10 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
   return { rawGraph, is_truncated: rawData.is_truncated }
 }
 
+const isHierarchyGraph = (rawGraph: RawGraph | null): boolean => {
+  return Boolean(rawGraph?.edges.some(edge => edge.properties?.edge_type === 'hierarchy'))
+}
+
 // Create a new graph instance with the raw graph data
 const createSigmaGraph = (rawGraph: RawGraph | null) => {
   // Get edge size settings from store
@@ -219,12 +225,14 @@ const createSigmaGraph = (rawGraph: RawGraph | null) => {
   for (const rawEdge of rawGraph?.edges ?? []) {
     // Get weight from edge properties or default to 1
     const weight = rawEdge.properties?.weight !== undefined ? Number(rawEdge.properties.weight) : 1
+    const isHierarchyEdge = rawEdge.properties?.edge_type === 'hierarchy'
 
     rawEdge.dynamicId = graph.addEdge(rawEdge.source, rawEdge.target, {
-      label: rawEdge.properties?.keywords || undefined,
+      label: isHierarchyEdge ? 'contains' : rawEdge.properties?.keywords || undefined,
       size: weight, // Set initial size based on weight
       originalWeight: weight, // Store original weight for recalculation
-      type: 'curvedNoArrow' // Explicitly set edge type to no arrow
+      edgeType: rawEdge.properties?.edge_type,
+      type: isHierarchyEdge ? 'curvedArrow' : 'curvedNoArrow'
     })
   }
 
@@ -467,6 +475,12 @@ const useLightrangeGraph = () => {
       if (!sigmaGraph || !rawGraph) return;
 
       try {
+        if (isHierarchyGraph(rawGraph)) {
+          toast.info(t('graphPanel.propertiesView.node.noNewNodes'))
+          useGraphStore.getState().triggerNodeExpand(null)
+          return
+        }
+
         // Get the node to expand
         const nodeToExpand = rawGraph.getNode(nodeId);
         if (!nodeToExpand) {
@@ -762,6 +776,7 @@ const useLightrangeGraph = () => {
 
           // Get weight from edge properties or default to 1
           const weight = newEdge.properties?.weight !== undefined ? Number(newEdge.properties.weight) : 1;
+          const isHierarchyEdge = newEdge.properties?.edge_type === 'hierarchy';
 
           // Update min and max weight values
           minWeight = Math.min(minWeight, weight);
@@ -769,10 +784,11 @@ const useLightrangeGraph = () => {
 
           // Add the edge to the sigma graph
           newEdge.dynamicId = sigmaGraph.addEdge(newEdge.source, newEdge.target, {
-            label: newEdge.properties?.keywords || undefined,
+            label: isHierarchyEdge ? 'contains' : newEdge.properties?.keywords || undefined,
             size: weight, // Set initial size based on weight
             originalWeight: weight, // Store original weight for recalculation
-            type: 'curvedNoArrow' // Explicitly set edge type to no arrow
+            edgeType: newEdge.properties?.edge_type,
+            type: isHierarchyEdge ? 'curvedArrow' : 'curvedNoArrow'
           });
 
           // Add the edge to the raw graph

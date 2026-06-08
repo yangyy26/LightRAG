@@ -41,6 +41,25 @@ export type LightragEdgeType = {
 export type LightragGraphType = {
   nodes: LightragNodeType[]
   edges: LightragEdgeType[]
+  is_truncated?: boolean
+}
+
+export type LightragHierarchyNodeType = Record<string, any> & {
+  entity_id: string
+  entity_name?: string
+  children?: LightragHierarchyNodeType[]
+}
+
+export type LightragHierarchiesResponse = {
+  items: LightragHierarchyNodeType[]
+  count: number
+}
+
+export type HierarchyRetryResponse = {
+  doc_id: string
+  root_id: string
+  status?: 'processing' | 'success' | 'failed'
+  error?: string | null
 }
 
 export type LightragQueueStatus = {
@@ -252,6 +271,9 @@ export type DocActionResponse = {
   status: 'success' | 'partial_success' | 'failure'
   message: string
   track_id?: string
+  doc_id?: string
+  root_id?: string
+  file_path?: string
 }
 
 export type ScanResponse = {
@@ -358,6 +380,15 @@ export type PipelineStatusResponse = {
   cancellation_requested?: boolean
   latest_message: string
   history_messages?: string[]
+  hierarchy_busy?: boolean
+  hierarchy_status?: string
+  hierarchy_total?: number
+  hierarchy_done?: number
+  hierarchy_failed?: number
+  hierarchy_current_doc?: string
+  hierarchy_current_file?: string
+  hierarchy_latest_message?: string
+  hierarchy_history_messages?: string[]
   update_status?: Record<string, any>
 }
 
@@ -634,8 +665,128 @@ export const queryGraphs = async (
   maxDepth: number,
   maxNodes: number
 ): Promise<LightragGraphType> => {
+  return graphsGet(label, maxDepth, maxNodes)
+}
+
+const defaultGraphsGet = async (
+  label: string,
+  maxDepth: number,
+  maxNodes: number
+): Promise<LightragGraphType> => {
   const response = await axiosInstance.get(`/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
   return response.data
+}
+
+let graphsGet = defaultGraphsGet
+
+export const __resetGraphsGetForTests = (): void => {
+  graphsGet = defaultGraphsGet
+}
+
+export const __setGraphsGetForTests = (
+  get: (label: string, maxDepth: number, maxNodes: number) => Promise<LightragGraphType>
+): void => {
+  graphsGet = get
+}
+
+const hierarchyTreeToGraph = (root: LightragHierarchyNodeType): LightragGraphType => {
+  const nodes: LightragNodeType[] = []
+  const edges: LightragEdgeType[] = []
+
+  const visit = (node: LightragHierarchyNodeType, parentId?: string) => {
+    const nodeId = String(node.entity_id)
+    const properties = { ...node }
+    delete properties.children
+    nodes.push({
+      id: nodeId,
+      labels: [String(node.entity_name || nodeId)],
+      properties
+    })
+
+    if (parentId) {
+      edges.push({
+        id: `${parentId}-${nodeId}`,
+        source: parentId,
+        target: nodeId,
+        type: 'DIRECTED',
+        properties: {
+          edge_type: 'hierarchy',
+          relation_type: 'contains',
+          keywords: 'contains,hierarchy',
+          weight: 1,
+          root_id: root.entity_id,
+          parent_id: parentId,
+          child_id: nodeId
+        }
+      })
+    }
+
+    for (const child of node.children || []) {
+      visit(child, nodeId)
+    }
+  }
+
+  visit(root)
+  return { nodes, edges, is_truncated: false }
+}
+
+export const queryGraphHierarchy = async (
+  rootId: string,
+  maxDepth: number
+): Promise<LightragGraphType> => {
+  const response = await hierarchyGet(`/graph/hierarchy?root_id=${encodeURIComponent(rootId)}&max_depth=${maxDepth}`)
+  return hierarchyTreeToGraph(response.data)
+}
+
+export const queryGraphHierarchies = async (
+  maxDepth: number
+): Promise<LightragHierarchiesResponse> => {
+  const response = await axiosInstance.get(`/graph/hierarchies?max_depth=${maxDepth}`)
+  return response.data
+}
+
+export const retryGraphHierarchy = async (
+  docId: string
+): Promise<HierarchyRetryResponse> => {
+  const response = await axiosInstance.post('/graph/hierarchy/retry', { doc_id: docId })
+  return response.data
+}
+
+const isHierarchyNotFound = (error: unknown): boolean => {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'response' in error &&
+    (error as { response?: { status?: number } }).response?.status === 404
+  )
+}
+
+export const queryResourceGraph = async (
+  label: string,
+  maxDepth: number,
+  maxNodes: number
+): Promise<LightragGraphType> => {
+  try {
+    return await queryGraphHierarchy(label, maxDepth)
+  } catch (error) {
+    if (!isHierarchyNotFound(error)) {
+      throw error
+    }
+    return queryGraphs(label, maxDepth, maxNodes)
+  }
+}
+
+const defaultHierarchyGet = async (url: string) => axiosInstance.get(url)
+let hierarchyGet = defaultHierarchyGet
+
+export const __resetHierarchyGetForTests = (): void => {
+  hierarchyGet = defaultHierarchyGet
+}
+
+export const __setHierarchyGetForTests = (
+  get: (url: string) => Promise<{ data: LightragHierarchyNodeType }>
+): void => {
+  hierarchyGet = get
 }
 
 export const getGraphLabels = async (): Promise<string[]> => {

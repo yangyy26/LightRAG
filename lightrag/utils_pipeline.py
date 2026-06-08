@@ -275,6 +275,10 @@ _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "analyzing_start_time",
     "analyzing_end_time",
     "analyzing_stage_skipped",
+    "hierarchy_status",
+    "hierarchy_error",
+    "hierarchy_root_id",
+    "hierarchy_updated_at",
 )
 
 

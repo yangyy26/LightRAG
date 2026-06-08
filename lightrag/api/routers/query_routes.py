@@ -69,6 +69,34 @@ class QueryRequest(BaseModel):
         ge=1,
     )
 
+    enable_hierarchy_context: Optional[bool] = Field(
+        default=None,
+        description="If true, expands context with resource-local hierarchy information.",
+    )
+    hierarchy_parent_depth: Optional[int] = Field(
+        default=None,
+        description="Ancestor depth for hierarchy context expansion.",
+        ge=0,
+        le=10,
+    )
+    hierarchy_child_depth: Optional[int] = Field(
+        default=None,
+        description="Child depth for hierarchy context expansion.",
+        ge=0,
+        le=10,
+    )
+    hierarchy_sibling_limit: Optional[int] = Field(
+        default=None,
+        description="Maximum sibling concepts included per matched hierarchy node.",
+        ge=0,
+        le=50,
+    )
+    max_hierarchy_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum token budget for hierarchy context.",
+        ge=0,
+    )
+
     hl_keywords: list[str] = Field(
         default_factory=list,
         description="List of high-level keywords to prioritize in retrieval. Leave empty to use the LLM to generate the keywords.",

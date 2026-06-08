@@ -104,14 +104,22 @@ def _validate_openai_response_format(response_format: Any | None) -> None:
 # Module-level cache for tiktoken encodings
 _TIKTOKEN_ENCODING_CACHE: dict[str, Any] = {}
 
-# Whether to request base64-encoded embeddings from the API.
-# Base64 is more efficient over the wire; set EMBEDDING_USE_BASE64=false for
-# providers that don't support it (e.g. Yandex Cloud).
-EMBEDDING_USE_BASE64: bool = os.getenv("EMBEDDING_USE_BASE64", "true").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+# Whether to request a specific embedding encoding format from the API.
+# Base64 is more efficient over the wire. Some OpenAI-compatible proxies reject
+# encoding_format entirely; set EMBEDDING_USE_BASE64=omit for those providers.
+_EMBEDDING_ENCODING_MODE = os.getenv("EMBEDDING_USE_BASE64", "true").strip().lower()
+if _EMBEDDING_ENCODING_MODE in {"true", "1", "yes", "base64"}:
+    EMBEDDING_ENCODING_FORMAT: str | None = "base64"
+elif _EMBEDDING_ENCODING_MODE in {"false", "0", "no", "float"}:
+    EMBEDDING_ENCODING_FORMAT = "float"
+elif _EMBEDDING_ENCODING_MODE in {"omit", "none", "auto", ""}:
+    EMBEDDING_ENCODING_FORMAT = None
+else:
+    logger.warning(
+        "Unknown EMBEDDING_USE_BASE64=%r; omitting embedding encoding_format",
+        _EMBEDDING_ENCODING_MODE,
+    )
+    EMBEDDING_ENCODING_FORMAT = None
 
 
 def _get_tiktoken_encoding_for_model(model: str) -> Any:
@@ -1014,9 +1022,10 @@ async def openai_embed(
             "input": texts,
         }
 
-        # Add encoding_format parameter (some providers like Yandex don't support base64)
-        # OpenAI client defaults to base64, so we must explicitly set it to "float" if disabled
-        api_params["encoding_format"] = "base64" if EMBEDDING_USE_BASE64 else "float"
+        # Add encoding_format only when configured. Some OpenAI-compatible
+        # gateways reject this optional OpenAI parameter entirely.
+        if EMBEDDING_ENCODING_FORMAT is not None:
+            api_params["encoding_format"] = EMBEDDING_ENCODING_FORMAT
 
         # Add dimensions parameter only if embedding_dim is provided
         if embedding_dim is not None:
