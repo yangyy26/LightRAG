@@ -82,9 +82,21 @@ export const supportedFileTypes = {
     '.less'
   ],
   'application/pdf': ['.pdf'],
+  'application/msword': ['.doc'],
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx']
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+  'video/mp4': ['.mp4'],
+  'video/x-msvideo': ['.avi'],
+  'video/quicktime': ['.mov'],
+  'video/x-ms-wmv': ['.wmv'],
+  'video/x-flv': ['.flv'],
+  'video/x-matroska': ['.mkv'],
+  'audio/mpeg': ['.mp3'],
+  'audio/wav': ['.wav'],
+  'audio/x-m4a': ['.m4a'],
+  'audio/aac': ['.aac'],
+  'audio/flac': ['.flac']
 }
 
 export const SiteInfo = {

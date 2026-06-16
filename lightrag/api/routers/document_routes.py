@@ -3,6 +3,7 @@ This module contains all document-related routes for the LightRAG API.
 """
 
 import asyncio
+import os
 import re
 import shutil
 import time
@@ -22,13 +23,17 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from lightrag.api import media_transcription
 from lightrag.api.workspace import WorkspaceContext
 from lightrag.base import DocProcessingStatus, DocStatus
 from lightrag.constants import (
     FULL_DOCS_FORMAT_PENDING_PARSE,
+    FULL_DOCS_FORMAT_RAW,
     PARSER_ENGINE_LEGACY,
+    PARSER_ENGINE_NATIVE,
     PARSED_ARTIFACT_DIR_SUFFIXES,
     PARSED_DIR_NAME,
     PROCESS_OPTION_CHUNK_FIXED,
@@ -47,6 +52,7 @@ from lightrag.parser.routing import (
 from lightrag.utils import (
     compute_mdhash_id,
     generate_track_id,
+    get_content_summary,
     move_file_to_parsed_dir,
 )
 from .auth import get_router_auth_dependency as _shared_router_auth_dependency
@@ -995,6 +1001,7 @@ class DocumentManager:
             ".md",
             ".mdx",  # MDX (Markdown + JSX)
             ".pdf",
+            ".doc",
             ".docx",
             ".pptx",
             ".xlsx",
@@ -1031,6 +1038,17 @@ class DocumentManager:
             ".css",  # Cascading Style Sheets
             ".scss",  # Sassy CSS
             ".less",  # LESS CSS
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".wmv",
+            ".flv",
+            ".mkv",
+            ".mp3",
+            ".wav",
+            ".m4a",
+            ".aac",
+            ".flac",
         ),
     ):
         # Store the base input directory and workspace
@@ -1815,6 +1833,45 @@ def _extract_xlsx(file_bytes: bytes) -> str:
     return "\n".join(content_parts)
 
 
+class DocConversionError(RuntimeError):
+    pass
+
+
+async def _convert_doc_to_docx(file_path: Path) -> Path:
+    endpoint = os.getenv("DOC_CONVERT_ENDPOINT", "").strip()
+    if not endpoint:
+        raise DocConversionError(
+            "DOC conversion is not configured. Set DOC_CONVERT_ENDPOINT to a "
+            "LibreOffice-compatible conversion service."
+        )
+
+    try:
+        import httpx
+    except ImportError as exc:
+        raise DocConversionError("httpx is required for DOC conversion") from exc
+
+    converted_path = file_path.with_suffix(".docx")
+    timeout = float(os.getenv("DOC_CONVERT_TIMEOUT", "120"))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with file_path.open("rb") as file_obj:
+            response = await client.post(
+                endpoint,
+                files={
+                    "file": (
+                        file_path.name,
+                        file_obj,
+                        "application/msword",
+                    )
+                },
+                data={"target": "docx"},
+            )
+    response.raise_for_status()
+    converted_path.write_bytes(response.content)
+    if converted_path.stat().st_size == 0:
+        raise DocConversionError("DOC conversion returned an empty DOCX file")
+    return converted_path
+
+
 async def pipeline_enqueue_file(
     rag: "LightRAG",
     file_path: Path,
@@ -1873,6 +1930,63 @@ async def pipeline_enqueue_file(
             return False, track_id
 
         api_process_options = process_options or PROCESS_OPTION_CHUNK_FIXED
+        if ext == ".doc":
+            try:
+                converted_docx = await _convert_doc_to_docx(file_path)
+            except Exception as e:
+                error_files = [
+                    {
+                        "file_path": str(file_path.name),
+                        "error_description": "[File Extraction]DOC conversion error",
+                        "original_error": f"Failed to convert DOC to DOCX: {str(e)}",
+                        "file_size": file_size,
+                    }
+                ]
+                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                logger.error(
+                    f"[File Extraction]Error converting DOC {file_path.name}: {str(e)}"
+                )
+                return False, track_id
+
+            try:
+                enqueue_result = await rag.apipeline_enqueue_documents(
+                    "",
+                    file_paths=str(converted_docx),
+                    track_id=track_id,
+                    docs_format=FULL_DOCS_FORMAT_PENDING_PARSE,
+                    parse_engine=PARSER_ENGINE_NATIVE,
+                    process_options=api_process_options,
+                    from_scan=from_scan,
+                )
+                if enqueue_result is None:
+                    try:
+                        await move_file_to_parsed_dir(converted_docx)
+                    except Exception as move_error:
+                        logger.error(
+                            f"Failed to move duplicate file {converted_docx.name} to {PARSED_DIR_NAME} directory: {move_error}"
+                        )
+                    return False, track_id
+                logger.info(
+                    f"[File Extraction]Converted {file_path.name} to {converted_docx.name} and deferred to native parser"
+                )
+                return True, track_id
+            except Exception as e:
+                error_files = [
+                    {
+                        "file_path": str(file_path.name),
+                        "error_description": "[File Extraction]Converted DOC enqueue error",
+                        "original_error": (
+                            f"Failed to enqueue converted DOCX for parser: {str(e)}"
+                        ),
+                        "file_size": file_size,
+                    }
+                ]
+                await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                logger.error(
+                    f"[File Extraction]Error enqueuing converted DOC {file_path.name}: {str(e)}"
+                )
+                return False, track_id
+
         if extraction_engine != PARSER_ENGINE_LEGACY:
             try:
                 enqueue_kwargs = {
@@ -2273,6 +2387,162 @@ async def pipeline_enqueue_file(
                 file_path.unlink()
             except Exception as e:
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
+
+
+async def enqueue_media_transcription(
+    *,
+    rag: "LightRAG",
+    file_path: Path,
+    canonical_file_path: str,
+    doc_id: str,
+    track_id: str,
+    mime_type: str | None,
+) -> None:
+    config = media_transcription.load_transcription_config()
+    now = datetime.now(timezone.utc).isoformat()
+    file_size = file_path.stat().st_size if file_path.exists() else 0
+    status_doc = {
+        "status": DocStatus.PARSING,
+        "content_summary": "Media transcription pending",
+        "content_length": file_size,
+        "chunks_count": 0,
+        "chunks_list": [],
+        "created_at": now,
+        "updated_at": now,
+        "file_path": canonical_file_path,
+        "track_id": track_id,
+        "metadata": {
+            "media_transcription_status": "pending",
+            "media_source_file": file_path.name,
+            "media_mime_type": mime_type or "",
+        },
+    }
+    await _upsert_doc_status_and_flush(rag, {doc_id: status_doc})
+    uploaded_media_url = None
+    try:
+        gfkd_upload_config = media_transcription.load_gfkd_upload_config()
+        if gfkd_upload_config is not None:
+            uploaded_media_url = await media_transcription.upload_media_to_gfkd(
+                gfkd_upload_config,
+                file_path,
+                filename=canonical_file_path,
+                content_type=mime_type,
+            )
+            status_doc["metadata"]["media_uploaded_url"] = uploaded_media_url
+            await _upsert_doc_status_and_flush(rag, {doc_id: status_doc})
+
+        payload = media_transcription.build_transcription_payload(
+            config,
+            workspace=getattr(rag, "workspace", "") or "default",
+            doc_id=doc_id,
+            media_url=uploaded_media_url,
+        )
+        await media_transcription.trigger_transcription(config, payload)
+    except Exception as exc:
+        metadata = dict(status_doc["metadata"])
+        metadata["media_transcription_status"] = "failed"
+        await _upsert_doc_status_and_flush(
+            rag,
+            {
+                doc_id: {
+                    **status_doc,
+                    "status": DocStatus.FAILED,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "error_msg": str(exc),
+                    "metadata": metadata,
+                }
+            },
+        )
+        logger.error(
+            "Failed to trigger media transcription for %s via %s: %s",
+            canonical_file_path,
+            config.endpoint,
+            str(exc),
+        )
+
+
+async def apply_media_transcription_callback(
+    rag: "LightRAG", payload: dict[str, Any]
+) -> None:
+    doc_id = media_transcription.callback_task_id(payload)
+    status_doc = await rag.doc_status.get_by_id(doc_id)
+    if not status_doc:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+
+    metadata = dict(status_doc.get("metadata", {}) or {})
+    now = datetime.now(timezone.utc).isoformat()
+    file_path = normalize_file_path(status_doc.get("file_path"))
+
+    if media_transcription.callback_failed(payload):
+        metadata["media_transcription_status"] = "failed"
+        await _upsert_doc_status_and_flush(
+            rag,
+            {
+                doc_id: {
+                    **status_doc,
+                    "status": DocStatus.FAILED,
+                    "updated_at": now,
+                    "error_msg": media_transcription.callback_error_message(payload),
+                    "metadata": metadata,
+                }
+            },
+        )
+        return
+
+    try:
+        text = media_transcription.extract_transcription_text(payload)
+    except Exception as exc:
+        metadata["media_transcription_status"] = "failed"
+        await _upsert_doc_status_and_flush(
+            rag,
+            {
+                doc_id: {
+                    **status_doc,
+                    "status": DocStatus.FAILED,
+                    "updated_at": now,
+                    "error_msg": str(exc),
+                    "metadata": metadata,
+                }
+            },
+        )
+        return
+
+    metadata["media_transcription_status"] = "completed"
+    metadata["media_transcription_length"] = len(text)
+    await rag.full_docs.upsert(
+        {
+            doc_id: {
+                "content": text,
+                "file_path": file_path,
+                "parse_format": FULL_DOCS_FORMAT_RAW,
+            }
+        }
+    )
+    await rag.full_docs.index_done_callback()
+    await _upsert_doc_status_and_flush(
+        rag,
+        {
+            doc_id: {
+                **status_doc,
+                "status": DocStatus.PENDING,
+                "content_summary": get_content_summary(text),
+                "content_length": len(text),
+                "chunks_count": 0,
+                "chunks_list": [],
+                "updated_at": now,
+                "error_msg": None,
+                "metadata": metadata,
+            }
+        },
+    )
+    await rag.apipeline_process_enqueue_documents()
+
+
+async def _upsert_doc_status_and_flush(
+    rag: "LightRAG", rows: dict[str, dict[str, Any]]
+) -> None:
+    await rag.doc_status.upsert(rows)
+    await rag.doc_status.index_done_callback()
 
 
 async def pipeline_index_file(rag: "LightRAG", file_path: Path, track_id: str = None):
@@ -2982,6 +3252,16 @@ def create_document_routes(
     workspace_dependency = _coerce_workspace_dependency(
         workspace_dependency, doc_manager
     )
+    workspace_manager = getattr(workspace_dependency, "_workspace_manager", None)
+
+    async def _require_workspace_context(workspace_id: str | None) -> WorkspaceContext:
+        if workspace_manager is not None:
+            return await workspace_manager.require_context(workspace_id)
+        context = await workspace_dependency()
+        if workspace_id and workspace_id != getattr(context, "workspace_id", None):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        return context
+
     # Fresh router per call — see the note above the temp_prefix constant.
     router = APIRouter(
         prefix="/documents",
@@ -3339,7 +3619,17 @@ def create_document_routes(
             # loop's request_pending mechanism.
             async def _indexing_task():
                 try:
-                    await pipeline_index_file(rag, file_path, track_id)
+                    if media_transcription.is_media_file(file_path):
+                        await enqueue_media_transcription(
+                            rag=rag,
+                            file_path=file_path,
+                            canonical_file_path=upload_file_path,
+                            doc_id=upload_doc_id,
+                            track_id=track_id,
+                            mime_type=file.content_type,
+                        )
+                    else:
+                        await pipeline_index_file(rag, file_path, track_id)
                 finally:
                     await _release_enqueue_slot(rag)
 
@@ -4583,5 +4873,44 @@ def create_document_routes(
             logger.error(f"Error requesting pipeline cancellation: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get("/media/files/{workspace_id}/{doc_id}")
+    async def get_media_file(
+        workspace_id: str,
+        doc_id: str,
+    ):
+        context = await _require_workspace_context(workspace_id)
+        rag = context.rag
+        doc_manager = context.doc_manager
+        status_doc = await rag.doc_status.get_by_id(doc_id)
+        if not status_doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        metadata = status_doc.get("metadata", {}) or {}
+        source_name = metadata.get("media_source_file") or status_doc.get("file_path")
+        if not source_name or not media_transcription.is_media_file(source_name):
+            raise HTTPException(status_code=404, detail="Media file not found")
+
+        safe_path = validate_file_path_security(str(source_name), doc_manager.input_dir)
+        if safe_path is None or not safe_path.is_file():
+            raise HTTPException(status_code=404, detail="Media file not found")
+
+        return FileResponse(
+            path=safe_path, media_type=metadata.get("media_mime_type") or None
+        )
+
+    @router.post("/media/transcribe_callback")
+    async def media_transcribe_callback(
+        payload: dict[str, Any],
+    ):
+        workspace_id = str(payload.get("workspace") or "").strip()
+        if not workspace_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing workspace in transcription callback",
+            )
+        context = await _require_workspace_context(workspace_id)
+        await apply_media_transcription_callback(context.rag, payload)
+        return {"status": "success"}
 
     return router

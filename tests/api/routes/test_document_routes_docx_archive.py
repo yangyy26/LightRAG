@@ -370,6 +370,66 @@ async def test_pipeline_enqueue_docx_plain_text_extracts_before_enqueue(
     assert (tmp_path / PARSED_DIR_NAME / file_path.name).exists()
 
 
+async def test_pipeline_enqueue_doc_converts_to_docx_and_defers_native(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "doc:legacy,*:legacy")
+    converted_paths = []
+
+    async def fake_convert_doc_to_docx(path):
+        converted_path = path.with_suffix(".docx")
+        converted_path.write_bytes(b"converted docx bytes")
+        converted_paths.append((path, converted_path))
+        return converted_path
+
+    monkeypatch.setattr(
+        _document_routes, "_convert_doc_to_docx", fake_convert_doc_to_docx
+    )
+    file_path = tmp_path / "legacy.doc"
+    file_path.write_bytes(b"binary doc bytes")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(rag, file_path, "track-doc")
+
+    converted_path = tmp_path / "legacy.docx"
+    assert success is True
+    assert returned_track_id == "track-doc"
+    assert converted_paths == [(file_path, converted_path)]
+    assert rag.enqueued == [
+        {
+            "input": "",
+            "file_path": str(converted_path),
+            "track_id": "track-doc",
+            "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+            "parse_engine": "native",
+            "process_options": PROCESS_OPTION_CHUNK_FIXED,
+            "chunk_options": None,
+            "from_scan": False,
+        }
+    ]
+
+
+async def test_pipeline_enqueue_doc_without_converter_records_clear_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "doc:legacy,*:legacy")
+    monkeypatch.delenv("DOC_CONVERT_ENDPOINT", raising=False)
+    file_path = tmp_path / "legacy.doc"
+    file_path.write_bytes(b"binary doc bytes")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(rag, file_path, "track-doc")
+
+    assert success is False
+    assert returned_track_id == "track-doc"
+    assert rag.errors
+    assert rag.errors[0][0]["error_description"] == (
+        "[File Extraction]DOC conversion error"
+    )
+    assert "DOC conversion is not configured" in rag.errors[0][0]["original_error"]
+    assert "MINERU_API_TOKEN" not in rag.errors[0][0]["original_error"]
+
+
 async def test_pipeline_enqueue_md_moves_after_enqueue(tmp_path, monkeypatch):
     monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
     file_path = tmp_path / "notes.md"

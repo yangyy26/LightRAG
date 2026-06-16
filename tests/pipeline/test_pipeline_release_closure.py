@@ -301,6 +301,34 @@ def test_resolve_file_parser_directives_priority(monkeypatch):
 
 
 @pytest.mark.offline
+def test_doc_routes_to_mineru_when_configured(monkeypatch):
+    from lightrag.parser.routing import resolve_file_parser_directives
+
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://mineru.local")
+    monkeypatch.setenv("LIGHTRAG_PARSER", "doc:mineru-R,*:legacy-F")
+
+    engine, options = resolve_file_parser_directives("legacy.doc")
+
+    assert engine == "mineru"
+    assert options == "R"
+
+
+@pytest.mark.offline
+def test_doc_does_not_silently_fall_back_to_legacy_without_mineru(monkeypatch):
+    from lightrag.parser.routing import resolve_file_parser_directives
+
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.delenv("MINERU_LOCAL_ENDPOINT", raising=False)
+    monkeypatch.setenv("LIGHTRAG_PARSER", "doc:mineru-R,*:legacy-F")
+
+    engine, options = resolve_file_parser_directives("legacy.doc")
+
+    assert engine == "legacy"
+    assert options == ""
+
+
+@pytest.mark.offline
 def test_doc_status_metadata_carry_over_helper():
     """``doc_status_transition_metadata`` preserves long-lived per-doc fields
     and layers in any transition-specific extras passed via ``extra=``.

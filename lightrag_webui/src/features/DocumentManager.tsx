@@ -917,18 +917,8 @@ export default function DocumentManager() {
           setCurrentPageDocs(response.documents);
           setStatusCounts(response.status_counts);
 
-          const legacyDocs: DocsStatusesResponse = {
-            statuses: {
-              processed: response.documents.filter(doc => doc.status === 'processed'),
-              preprocessed: response.documents.filter(doc => doc.status === 'preprocessed'),
-              processing: response.documents.filter(doc => doc.status === 'processing'),
-              pending: response.documents.filter(doc => doc.status === 'pending'),
-              failed: response.documents.filter(doc => doc.status === 'failed')
-            }
-          };
-
           if (response.pagination.total_count > 0) {
-            setDocs(legacyDocs);
+            setDocs(buildLegacyDocs(response.documents));
           } else {
             setDocs(null);
           }

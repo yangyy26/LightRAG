@@ -285,4 +285,5 @@ def make_workspace_dependency(manager: WorkspaceManager):
         workspace_id = get_workspace_header(request)
         return await manager.require_context(workspace_id)
 
+    dependency._workspace_manager = manager  # type: ignore[attr-defined]
     return dependency
