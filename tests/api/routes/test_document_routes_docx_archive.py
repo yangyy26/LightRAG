@@ -36,6 +36,7 @@ pipeline_enqueue_file = _document_routes.pipeline_enqueue_file
 run_scanning_process = _document_routes.run_scanning_process
 DocumentManager = _document_routes.DocumentManager
 create_document_routes = _document_routes.create_document_routes
+WorkspaceContext = _document_routes.WorkspaceContext
 
 pytestmark = pytest.mark.offline
 
@@ -1054,6 +1055,121 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
     assert excinfo.value.status_code == 409
     assert "existing.docx" in excinfo.value.detail
     assert not (tmp_path / "existing.[native].docx").exists()
+
+
+async def test_upload_allows_video_up_to_two_gb_when_default_limit_is_smaller(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_router_auth_dependency",
+        lambda api_key=None: (lambda: None),
+    )
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_global_args",
+        lambda: SimpleNamespace(max_upload_size=100 * 1024 * 1024),
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="lecture.mp4",
+        file=BytesIO(b"video bytes"),
+    )
+    upload_file.size = 150 * 1024 * 1024
+
+    bg = _document_routes.BackgroundTasks()
+    response = await upload_endpoint(
+        bg,
+        upload_file,
+        WorkspaceContext("default", rag, doc_manager),
+    )
+
+    assert response.status == "success"
+    assert (tmp_path / "lecture.mp4").exists()
+    assert len(bg.tasks) == 1
+
+
+async def test_upload_keeps_default_size_limit_for_non_video_files(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_router_auth_dependency",
+        lambda api_key=None: (lambda: None),
+    )
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_global_args",
+        lambda: SimpleNamespace(max_upload_size=100 * 1024 * 1024),
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="large.pdf",
+        file=BytesIO(b"pdf bytes"),
+    )
+    upload_file.size = 150 * 1024 * 1024
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(
+            _document_routes.BackgroundTasks(),
+            upload_file,
+            WorkspaceContext("default", rag, doc_manager),
+        )
+
+    assert excinfo.value.status_code == 413
+    assert "Maximum size: 100.0MB" in excinfo.value.detail
+    assert not (tmp_path / "large.pdf").exists()
+
+
+async def test_upload_rejects_video_over_two_gb(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_router_auth_dependency",
+        lambda api_key=None: (lambda: None),
+    )
+    monkeypatch.setattr(
+        _document_routes,
+        "_get_global_args",
+        lambda: SimpleNamespace(max_upload_size=100 * 1024 * 1024),
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="too_large.mp4",
+        file=BytesIO(b"video bytes"),
+    )
+    upload_file.size = 2 * 1024 * 1024 * 1024 + 1
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(
+            _document_routes.BackgroundTasks(),
+            upload_file,
+            WorkspaceContext("default", rag, doc_manager),
+        )
+
+    assert excinfo.value.status_code == 413
+    assert "Maximum size: 2048.0MB" in excinfo.value.detail
+    assert not (tmp_path / "too_large.mp4").exists()
 
 
 async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypatch):

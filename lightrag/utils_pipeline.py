@@ -406,6 +406,24 @@ def doc_status_metadata_has_attempt_fields(status_doc: Any) -> bool:
     return not _DOC_STATUS_METADATA_ATTEMPT_KEYS.isdisjoint(raw_metadata)
 
 
+def doc_status_is_waiting_media_transcription(status_doc: Any) -> bool:
+    """True when a media row is waiting for external transcription text.
+
+    Media uploads write a PARSING placeholder before the transcription service
+    calls back with text. During that window the row intentionally has no
+    full_docs entry, so normal pipeline consistency cleanup must not treat it
+    as an inconsistent interrupted parse.
+    """
+    raw_metadata = doc_status_field(status_doc, "metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return False
+    return raw_metadata.get("media_transcription_status") in {
+        "pending",
+        "queued",
+        "processing",
+        "running",
+    }
+
 def doc_status_value(doc: Any) -> str:
     status = doc_status_field(doc, "status", "")
     if isinstance(status, DocStatus):

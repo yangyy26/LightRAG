@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from lightrag.base import DocStatus
+from lightrag.base import DocProcessingStatus
 from lightrag.utils import compute_mdhash_id
 
 _original_argv = sys.argv[:]
@@ -17,6 +18,20 @@ sys.argv = _original_argv
 DocumentManager = _dr.DocumentManager
 
 pytestmark = pytest.mark.offline
+
+
+@pytest.fixture(autouse=True)
+def _ensure_shared_storage_initialized():
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    shared_storage.initialize_share_data()
+    yield
+    if shared_storage._shared_dicts is not None:
+        for key in list(shared_storage._shared_dicts.keys()):
+            if key.endswith("pipeline_status") or key == "pipeline_status":
+                ns = shared_storage._shared_dicts[key]
+                if isinstance(ns, dict):
+                    ns["busy"] = False
+                    ns["scanning"] = False
 
 
 class _MemoryKV:
@@ -35,7 +50,15 @@ class _MemoryKV:
 
 
 class _MemoryDocStatus(_MemoryKV):
-    pass
+    async def get_doc_by_file_basename(self, basename):
+        for doc_id, row in self.rows.items():
+            if row.get("file_path") == basename:
+                return doc_id, row
+        return None
+
+    async def delete(self, ids):
+        for doc_id in ids:
+            self.rows.pop(doc_id, None)
 
 
 class _FakeRag:
@@ -282,6 +305,150 @@ def test_extract_transcription_text_rejects_empty_payload():
 
 def test_enqueue_media_transcription_creates_parsing_status(monkeypatch, tmp_path):
     asyncio.run(_assert_enqueue_media_transcription_creates_parsing_status(monkeypatch, tmp_path))
+
+
+def test_pipeline_enqueue_file_routes_mp3_to_media_transcription(monkeypatch, tmp_path):
+    asyncio.run(
+        _assert_pipeline_enqueue_file_routes_mp3_to_media_transcription(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+def test_scan_preserves_pending_media_transcription_status(monkeypatch, tmp_path):
+    asyncio.run(
+        _assert_scan_preserves_pending_media_transcription_status(monkeypatch, tmp_path)
+    )
+
+
+def test_pipeline_consistency_preserves_pending_media_transcription():
+    asyncio.run(_assert_pipeline_consistency_preserves_pending_media_transcription())
+
+
+async def _assert_pipeline_consistency_preserves_pending_media_transcription():
+    from lightrag.pipeline import _PipelineMixin
+
+    class PipelineProbe(_PipelineMixin):
+        def __init__(self):
+            self.full_docs = _MemoryKV()
+            self.doc_status = _MemoryDocStatus()
+
+    probe = PipelineProbe()
+    doc_id = compute_mdhash_id("voice.mp3", prefix="doc-")
+    status_doc = DocProcessingStatus(
+        status=DocStatus.PARSING,
+        content_summary="Media transcription pending",
+        content_length=5,
+        chunks_count=0,
+        chunks_list=[],
+        created_at="2026-06-24T00:00:00+00:00",
+        updated_at="2026-06-24T00:00:00+00:00",
+        file_path="voice.mp3",
+        track_id="upload-media",
+        metadata={
+            "media_transcription_status": "pending",
+            "media_source_file": "voice.mp3",
+        },
+    )
+    await probe.doc_status.upsert({doc_id: status_doc.__dict__.copy()})
+    pipeline_status = {"history_messages": []}
+    pipeline_status_lock = asyncio.Lock()
+
+    result = await probe._validate_and_fix_document_consistency(
+        {doc_id: status_doc},
+        pipeline_status,
+        pipeline_status_lock,
+    )
+
+    assert result == {}
+    assert await probe.doc_status.get_by_id(doc_id) is not None
+    assert pipeline_status["history_messages"] == [
+        "Preserving 1 pending media transcription document entries"
+    ]
+
+
+async def _assert_scan_preserves_pending_media_transcription_status(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.routers.document_routes import run_scanning_process
+
+    media_path = tmp_path / "voice.mp3"
+    media_path.write_bytes(b"audio")
+    media_doc_id = compute_mdhash_id("voice.mp3", prefix="doc-")
+    rag = _FakeRag()
+    await rag.doc_status.upsert(
+        {
+            media_doc_id: {
+                "status": DocStatus.PARSING,
+                "content_summary": "Media transcription pending",
+                "content_length": media_path.stat().st_size,
+                "chunks_count": 0,
+                "chunks_list": [],
+                "created_at": "2026-06-24T00:00:00+00:00",
+                "updated_at": "2026-06-24T00:00:00+00:00",
+                "file_path": "voice.mp3",
+                "track_id": "upload-media",
+                "metadata": {
+                    "media_transcription_status": "pending",
+                    "media_source_file": "voice.mp3",
+                },
+            }
+        }
+    )
+
+    async def fail_if_pipeline_index_files_called(*args, **kwargs):
+        raise AssertionError("pending media transcription must not be re-enqueued")
+
+    monkeypatch.setattr(
+        _dr, "pipeline_index_files", fail_if_pipeline_index_files_called
+    )
+
+    await run_scanning_process(rag, DocumentManager(str(tmp_path)), "scan-track")
+
+    status = await rag.doc_status.get_by_id(media_doc_id)
+    assert status is not None
+    assert status["status"] == DocStatus.PARSING
+    assert status["metadata"]["media_transcription_status"] == "pending"
+    assert rag.process_calls == 0
+    assert media_path.exists()
+
+
+async def _assert_pipeline_enqueue_file_routes_mp3_to_media_transcription(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.routers.document_routes import pipeline_enqueue_file
+
+    calls = []
+
+    async def fake_trigger(config, payload):
+        calls.append(payload)
+
+    monkeypatch.setenv(
+        "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
+    )
+    monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
+    monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
+    monkeypatch.delenv("GFKD_UPLOAD_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.trigger_transcription", fake_trigger
+    )
+    monkeypatch.setattr(_dr, "_get_global_args", lambda: SimpleNamespace())
+
+    rag = _FakeRag()
+    source = tmp_path / "voice.mp3"
+    source.write_bytes(b"audio")
+    doc_id = compute_mdhash_id("voice.mp3", prefix="doc-")
+
+    success, track_id = await pipeline_enqueue_file(rag, source, "scan-track")
+
+    status = await rag.doc_status.get_by_id(doc_id)
+    assert success is True
+    assert track_id == "scan-track"
+    assert status["status"] == DocStatus.PARSING
+    assert status["file_path"] == "voice.mp3"
+    assert status["metadata"]["media_transcription_status"] == "pending"
+    assert calls[0]["task_id"] == doc_id
+    assert source.exists()
 
 
 async def _assert_enqueue_media_transcription_creates_parsing_status(

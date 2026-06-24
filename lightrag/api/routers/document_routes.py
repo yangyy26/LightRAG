@@ -55,10 +55,22 @@ from lightrag.utils import (
     get_content_summary,
     move_file_to_parsed_dir,
 )
+from lightrag.utils_pipeline import doc_status_is_waiting_media_transcription
 from .auth import get_router_auth_dependency as _shared_router_auth_dependency
 
 if TYPE_CHECKING:
     from lightrag import LightRAG
+
+
+VIDEO_UPLOAD_SIZE_LIMIT = 2 * 1024 * 1024 * 1024
+
+
+def _resolve_upload_size_limit(filename: str, configured_limit: int | None) -> int | None:
+    if media_transcription.is_media_file(filename):
+        suffix = Path(filename).suffix.lower()
+        if suffix in media_transcription.MEDIA_VIDEO_EXTENSIONS:
+            return VIDEO_UPLOAD_SIZE_LIMIT
+    return configured_limit
 
 
 # Function to format datetime to ISO format string with timezone information
@@ -1910,6 +1922,19 @@ async def pipeline_enqueue_file(
         except Exception:
             file_size = 0
 
+        if media_transcription.is_media_file(file_path):
+            canonical_file_path = normalize_file_path(file_path.name)
+            doc_id = compute_mdhash_id(canonical_file_path, prefix="doc-")
+            await enqueue_media_transcription(
+                rag=rag,
+                file_path=file_path,
+                canonical_file_path=canonical_file_path,
+                doc_id=doc_id,
+                track_id=track_id,
+                mime_type=None,
+            )
+            return True, track_id
+
         try:
             extraction_engine, process_options = resolve_file_parser_directives(
                 file_path
@@ -2872,6 +2897,7 @@ async def run_scanning_process(
             #   * new_files       — no existing record; standard enqueue path.
             new_files: list[Path] = []
             resume_files: list[Path] = []
+            waiting_media_files: list[str] = []
             processed_files: list[str] = []
 
             for file_path in unique_files:
@@ -2905,6 +2931,14 @@ async def run_scanning_process(
                             f"Failed to move already processed file {filename} to {PARSED_DIR_NAME}: {move_error}"
                         )
                 elif existing_doc_data:
+                    if doc_status_is_waiting_media_transcription(existing_doc_data):
+                        logger.info(
+                            "Skipping media file waiting for transcription callback: "
+                            f"{filename}"
+                        )
+                        waiting_media_files.append(filename)
+                        continue
+
                     # FAILED rows recorded by apipeline_enqueue_error_documents
                     # never write a full_docs entry — extraction blew up before
                     # any content was stored.  _validate_and_fix_document_consistency
@@ -2983,12 +3017,16 @@ async def run_scanning_process(
                 await rag.apipeline_process_enqueue_documents()
 
             total_active = len(new_files) + len(resume_files)
-            if total_active or processed_files:
+            if total_active or processed_files or waiting_media_files:
                 summary_parts: list[str] = []
                 if total_active:
                     summary_parts.append(f"{total_active} files Processed")
                 if processed_files:
                     summary_parts.append(f"{len(processed_files)} skipped")
+                if waiting_media_files:
+                    summary_parts.append(
+                        f"{len(waiting_media_files)} waiting for media transcription"
+                    )
                 logger.info(f"Scanning process completed: {' '.join(summary_parts)}.")
             else:
                 logger.info(
@@ -3505,20 +3543,21 @@ def create_document_routes(
                     detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
                 )
 
+            upload_size_limit = _resolve_upload_size_limit(
+                safe_filename, global_args.max_upload_size
+            )
+
             # Check file size limit (if configured)
-            if (
-                global_args.max_upload_size is not None
-                and global_args.max_upload_size > 0
-            ):
+            if upload_size_limit is not None and upload_size_limit > 0:
                 # Safe access to file size (not available in older Starlette versions)
                 file_size = getattr(file, "size", None)
 
                 # Pre-flight size check (only if size is available)
                 if file_size is not None:
-                    if file_size > global_args.max_upload_size:
+                    if file_size > upload_size_limit:
                         raise HTTPException(
                             status_code=413,
-                            detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {file_size / 1024 / 1024:.1f}MB",
+                            detail=f"File too large. Maximum size: {upload_size_limit / 1024 / 1024:.1f}MB, uploaded: {file_size / 1024 / 1024:.1f}MB",
                         )
                 else:
                     # If size not available, we'll check during streaming
@@ -3578,12 +3617,9 @@ def create_document_routes(
                         break
 
                     # Check size limit during streaming (if not checked before)
-                    if (
-                        global_args.max_upload_size is not None
-                        and global_args.max_upload_size > 0
-                    ):
+                    if upload_size_limit is not None and upload_size_limit > 0:
                         bytes_written += len(chunk)
-                        if bytes_written > global_args.max_upload_size:
+                        if bytes_written > upload_size_limit:
                             needs_cleanup = True
                             break
 
@@ -3601,7 +3637,7 @@ def create_document_routes(
 
                 raise HTTPException(
                     status_code=413,
-                    detail=f"File too large. Maximum size: {global_args.max_upload_size / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
+                    detail=f"File too large. Maximum size: {upload_size_limit / 1024 / 1024:.1f}MB, uploaded: {bytes_written / 1024 / 1024:.1f}MB",
                 )
 
             track_id = generate_track_id("upload")

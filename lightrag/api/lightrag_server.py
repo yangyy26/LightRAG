@@ -70,12 +70,13 @@ from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
     get_namespace_data,
     get_default_workspace,
-    # set_default_workspace,
+    set_default_workspace,
     cleanup_keyed_lock,
     finalize_share_data,
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
+from lightrag.exceptions import PipelineNotInitializedError
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -2054,6 +2055,8 @@ def create_app(args):
         document_manager_cls=DocumentManager,
         default_workspace=args.workspace,
     )
+    server_default_workspace = workspace_manager.default_workspace
+    set_default_workspace(server_default_workspace)
     workspace_dependency = make_workspace_dependency(workspace_manager)
 
     # Build one uninitialized config instance for status display and role config logging.
@@ -2247,10 +2250,22 @@ def create_app(args):
             workspace = get_workspace_from_request(request)
             default_workspace = get_default_workspace()
             if workspace is None:
-                workspace = default_workspace
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=workspace
-            )
+                workspace = (
+                    default_workspace
+                    if default_workspace is not None
+                    else server_default_workspace
+                )
+            if default_workspace is None:
+                default_workspace = server_default_workspace
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=workspace
+                )
+            except PipelineNotInitializedError:
+                await workspace_manager.require_context(workspace)
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=workspace
+                )
 
             pipeline_busy = bool(pipeline_status.get("busy", False))
             pipeline_scanning = bool(pipeline_status.get("scanning", False))

@@ -84,6 +84,7 @@ from lightrag.utils_pipeline import (
     chunk_fields_from_status_doc,
     compute_text_content_hash,
     doc_status_field,
+    doc_status_is_waiting_media_transcription,
     doc_status_transition_metadata,
     get_duplicate_doc_by_content_hash,
     get_existing_doc_by_content_hash,
@@ -1687,6 +1688,7 @@ class _PipelineMixin:
         """Validate and fix document data consistency by deleting inconsistent entries, but preserve failed documents"""
         inconsistent_docs = []
         failed_docs_to_preserve = []
+        media_transcription_docs_to_preserve = []
         successful_deletions = 0
 
         # Check each document's data consistency
@@ -1694,6 +1696,9 @@ class _PipelineMixin:
             # Check if corresponding content exists in full_docs
             content_data = await self.full_docs.get_by_id(doc_id)
             if not content_data:
+                if doc_status_is_waiting_media_transcription(status_doc):
+                    media_transcription_docs_to_preserve.append(doc_id)
+                    continue
                 # Check if this is a failed document that should be preserved
                 if (
                     hasattr(status_doc, "status")
@@ -1713,6 +1718,20 @@ class _PipelineMixin:
 
             # Remove failed documents from processing list but keep them in doc_status
             for doc_id in failed_docs_to_preserve:
+                to_process_docs.pop(doc_id, None)
+
+        if media_transcription_docs_to_preserve:
+            async with pipeline_status_lock:
+                preserve_message = (
+                    "Preserving "
+                    f"{len(media_transcription_docs_to_preserve)} pending media "
+                    "transcription document entries"
+                )
+                logger.info(preserve_message)
+                pipeline_status["latest_message"] = preserve_message
+                pipeline_status["history_messages"].append(preserve_message)
+
+            for doc_id in media_transcription_docs_to_preserve:
                 to_process_docs.pop(doc_id, None)
 
         # Delete inconsistent document entries(excluding failed documents)

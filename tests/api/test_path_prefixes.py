@@ -9,7 +9,7 @@ OpenAPI spec for correct reverse proxy operation.
 
 import os
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 import pytest
@@ -172,6 +172,86 @@ class TestRoutesAtNaturalPaths:
             # Prefixed paths return 404 when no root_path is configured
             response = client.get("/test-api/docs")
             assert response.status_code == 404
+
+    def test_health_falls_back_to_args_workspace_when_shared_default_missing(
+        self, mock_args_no_prefix
+    ):
+        """Health must not call shared storage with workspace=None."""
+        mock_rag = MagicMock()
+        mock_rag.get_llm_role_config.return_value = {}
+        mock_rag.get_llm_queue_status = AsyncMock(return_value={})
+        mock_rag.get_embedding_queue_status = AsyncMock(return_value={})
+        mock_rag.get_rerank_queue_status = AsyncMock(return_value={})
+
+        async def fake_get_namespace_data(namespace, *, workspace=None, **kwargs):
+            assert namespace == "pipeline_status"
+            assert workspace == "default"
+            return {}
+
+        with (
+            patch("lightrag.api.lightrag_server.LightRAG", return_value=mock_rag),
+            patch(
+                "lightrag.api.lightrag_server.get_default_workspace",
+                return_value=None,
+            ),
+            patch(
+                "lightrag.api.lightrag_server.get_namespace_data",
+                side_effect=fake_get_namespace_data,
+            ),
+        ):
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_no_prefix)
+            client = TestClient(app)
+
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["configuration"]["workspace"] == "default"
+
+    def test_health_initializes_default_workspace_before_reading_pipeline_status(
+        self, mock_args_no_prefix
+    ):
+        """Cold-start health should initialize the default workspace context."""
+        from lightrag.exceptions import PipelineNotInitializedError
+
+        mock_rag = MagicMock()
+        mock_rag.get_llm_role_config.return_value = {}
+        mock_rag.get_llm_queue_status = AsyncMock(return_value={})
+        mock_rag.get_embedding_queue_status = AsyncMock(return_value={})
+        mock_rag.get_rerank_queue_status = AsyncMock(return_value={})
+
+        calls = {"get_namespace_data": 0}
+
+        async def fake_get_namespace_data(namespace, *, workspace=None, **kwargs):
+            assert namespace == "pipeline_status"
+            assert workspace == "default"
+            calls["get_namespace_data"] += 1
+            if calls["get_namespace_data"] == 1:
+                raise PipelineNotInitializedError(f"{workspace}:pipeline_status")
+            return {}
+
+        with (
+            patch("lightrag.api.lightrag_server.LightRAG", return_value=mock_rag),
+            patch(
+                "lightrag.api.workspace.WorkspaceManager.require_context",
+                new_callable=AsyncMock,
+            ) as require_context,
+            patch(
+                "lightrag.api.lightrag_server.get_namespace_data",
+                side_effect=fake_get_namespace_data,
+            ),
+        ):
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_no_prefix)
+            client = TestClient(app)
+
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        require_context.assert_awaited_once_with("default")
+        assert calls["get_namespace_data"] == 2
 
 
 class TestOpenAPISpecIntegration:
