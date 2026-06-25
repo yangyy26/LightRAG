@@ -1,10 +1,14 @@
 import importlib
 import asyncio
+import json
 import sys
 from datetime import datetime, timezone
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from lightrag.base import DocStatus
 from lightrag.base import DocProcessingStatus
@@ -16,6 +20,8 @@ _dr = importlib.import_module("lightrag.api.routers.document_routes")
 sys.argv = _original_argv
 
 DocumentManager = _dr.DocumentManager
+WorkspaceContext = _dr.WorkspaceContext
+create_document_routes = _dr.create_document_routes
 
 pytestmark = pytest.mark.offline
 
@@ -123,9 +129,10 @@ def test_media_suffix_detection():
     assert not is_media_file("report.docx")
 
 
-def test_transcription_payload_uses_explicit_public_base():
+def test_transcription_payload_requires_uploaded_media_url():
     from lightrag.api.media_transcription import (
         TranscriptionConfig,
+        TranscriptionPayloadError,
         build_transcription_payload,
     )
 
@@ -135,15 +142,8 @@ def test_transcription_payload_uses_explicit_public_base():
         public_base_url="http://10.88.88.50:9621",
     )
 
-    payload = build_transcription_payload(cfg, workspace="default", doc_id="doc-abc")
-
-    assert payload == {
-        "task_id": "doc-abc",
-        "workspace": "default",
-        "url": "http://10.88.88.50:9621/documents/media/files/default/doc-abc",
-        "bucketName": "whisper",
-        "callback": "http://10.88.88.50:9621/documents/media/transcribe_callback",
-    }
+    with pytest.raises(TranscriptionPayloadError, match="uploaded media URL"):
+        build_transcription_payload(cfg, workspace="default", doc_id="doc-abc")
 
 
 def test_transcription_payload_can_use_external_media_url():
@@ -162,33 +162,109 @@ def test_transcription_payload_can_use_external_media_url():
         cfg,
         workspace="default",
         doc_id="doc-abc",
-        media_url="http://192.168.60.143:6692/whisper/lecture.mp4",
+        media_url="http://objects.local/whisper/lecture.mp4",
     )
 
-    assert payload["url"] == "http://192.168.60.143:6692/whisper/lecture.mp4"
+    assert payload["url"] == "http://objects.local/whisper/lecture.mp4"
+    assert "bucket_name" not in payload
     assert payload["callback"] == (
         "http://10.88.88.50:9621/documents/media/transcribe_callback"
+        "?workspace=default"
     )
 
 
-def test_gfkd_upload_config_is_disabled_without_base_url(monkeypatch):
-    from lightrag.api.media_transcription import load_gfkd_upload_config
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"workspace": "default"}, "default"),
+        ({"workspace_id": "test"}, "test"),
+        ({"data": {"workspace": "nested"}}, "nested"),
+        ({"result": {"workspace_id": "result_ws"}}, "result_ws"),
+        ({"task_id": "doc-a"}, None),
+    ],
+)
+def test_callback_workspace_id_common_shapes(payload, expected):
+    from lightrag.api.routers.document_routes import get_callback_workspace_id
 
-    monkeypatch.delenv("GFKD_UPLOAD_BASE_URL", raising=False)
-
-    assert load_gfkd_upload_config() is None
+    assert get_callback_workspace_id(payload) == expected
 
 
-def test_upload_media_to_gfkd_runs_multipart_flow(monkeypatch, tmp_path):
-    asyncio.run(_assert_upload_media_to_gfkd_runs_multipart_flow(monkeypatch, tmp_path))
+def test_summarize_media_callback_payload_does_not_log_text():
+    from lightrag.api.routers.document_routes import summarize_media_callback_payload
+
+    summary = summarize_media_callback_payload(
+        {
+            "task_id": "doc-a",
+            "text": "secret transcript",
+            "data": {"segments": [{"text": "hidden"}]},
+        }
+    )
+
+    assert summary == {
+        "top_level_keys": ["data", "task_id", "text"],
+        "data_keys": ["segments"],
+        "top.text_length": 17,
+        "data.segments_count": 1,
+    }
+    assert "secret transcript" not in str(summary)
+    assert "hidden" not in str(summary)
 
 
-async def _assert_upload_media_to_gfkd_runs_multipart_flow(monkeypatch, tmp_path):
+def test_media_resource_config_is_disabled_without_base_url(monkeypatch):
+    from lightrag.api.media_transcription import load_media_resource_config
+
+    monkeypatch.delenv("MEDIA_RESOURCE_BASE_URL", raising=False)
+
+    assert load_media_resource_config() is None
+
+
+def test_media_resource_config_reads_paths_and_download_origin(monkeypatch):
+    from lightrag.api.media_transcription import load_media_resource_config
+
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setenv("MEDIA_RESOURCE_MULTIPART_CHECK_PATH", "custom/check")
+    monkeypatch.setenv("MEDIA_RESOURCE_MULTIPART_INIT_PATH", "/custom/init")
+    monkeypatch.setenv("MEDIA_RESOURCE_MULTIPART_MERGE_PATH", "/custom/merge")
+    monkeypatch.setenv("MEDIA_RESOURCE_PREVIEW_PATH", "/custom/preview")
+    monkeypatch.setenv("MEDIA_RESOURCE_DOWNLOAD_ORIGIN", "http://public-object:19000")
+
+    config = load_media_resource_config()
+
+    assert config.multipart_check_path == "/custom/check"
+    assert config.multipart_init_path == "/custom/init"
+    assert config.multipart_merge_path == "/custom/merge"
+    assert config.preview_path == "/custom/preview"
+    assert config.download_origin == "http://public-object:19000"
+
+
+def test_upload_media_to_resource_service_runs_multipart_flow(monkeypatch, tmp_path):
+    asyncio.run(_assert_upload_media_to_resource_service_runs_multipart_flow(monkeypatch, tmp_path))
+
+
+def test_upload_media_to_resource_service_infers_mp3_content_type(monkeypatch, tmp_path):
+    asyncio.run(
+        _assert_upload_media_to_resource_service_infers_mp3_content_type(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+def test_upload_media_to_resource_service_reuploads_fast_check_url_with_wrong_suffix(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _assert_upload_media_to_resource_service_reuploads_fast_check_url_with_wrong_suffix(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+async def _assert_upload_media_to_resource_service_runs_multipart_flow(monkeypatch, tmp_path):
     import httpx
 
     from lightrag.api.media_transcription import (
-        GfkdUploadConfig,
-        upload_media_to_gfkd,
+        MediaResourceConfig,
+        upload_media_to_resource_service,
     )
 
     source = tmp_path / "lecture.mp4"
@@ -241,13 +317,18 @@ async def _assert_upload_media_to_gfkd_runs_multipart_flow(monkeypatch, tmp_path
 
     monkeypatch.setattr("httpx.AsyncClient", Client)
 
-    result = await upload_media_to_gfkd(
-        GfkdUploadConfig(
-            base_url="http://gfkd.local",
+    result = await upload_media_to_resource_service(
+        MediaResourceConfig(
+            base_url="http://media.local",
             token="token-1",
-            domain="192.168.10.47",
+            domain="media-domain",
             chunk_size=3,
             timeout=10,
+            multipart_check_path="/gfkb/resource/rbs/multipart/check",
+            multipart_init_path="/gfkb/resource/rbs/multipart/init",
+            multipart_merge_path="/gfkb/resource/rbs/multipart/merge",
+            preview_path="/gfkb/resource/preview/getMeterialPreviewByUrl",
+            download_origin="",
         ),
         source,
         filename="lecture.mp4",
@@ -263,9 +344,189 @@ async def _assert_upload_media_to_gfkd_runs_multipart_flow(monkeypatch, tmp_path
         "POST",
     ]
     assert requests[0].headers["token"] == "token-1"
-    assert requests[0].headers["domain"] == "192.168.10.47"
+    assert requests[0].headers["domain"] == "media-domain"
     assert requests[2].content == b"abc"
     assert requests[3].content == b"def"
+
+
+async def _assert_upload_media_to_resource_service_infers_mp3_content_type(
+    monkeypatch, tmp_path
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        upload_media_to_resource_service,
+    )
+
+    source = tmp_path / "voice.mp3"
+    source.write_bytes(b"abcdef")
+    init_payloads = []
+    upload_content_types = []
+
+    def handler(request):
+        if request.url.path == "/check":
+            return httpx.Response(200, json={"code": 0})
+        if request.url.path == "/init":
+            init_payloads.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={
+                    "code": 1,
+                    "result": {
+                        "uploadId": "upload-1",
+                        "url": "http://objects/whisper/voice.mp3",
+                        "urlList": ["http://upload.local/chunk-1"],
+                    },
+                },
+            )
+        if request.url.host == "upload.local":
+            upload_content_types.append(request.headers["content-type"])
+            return httpx.Response(200)
+        if request.url.path == "/merge":
+            return httpx.Response(
+                200,
+                json={"code": 1, "url": "http://objects/whisper/voice.mp3"},
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    await upload_media_to_resource_service(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="",
+            domain="",
+            chunk_size=10,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/preview",
+            download_origin="",
+        ),
+        source,
+        filename="voice.mp3",
+        content_type=None,
+    )
+
+    assert init_payloads[0]["fileType"] == "audio"
+    assert init_payloads[0]["contentType"] == "audio/mpeg"
+    assert upload_content_types == ["audio/mpeg"]
+
+
+async def _assert_upload_media_to_resource_service_reuploads_fast_check_url_with_wrong_suffix(
+    monkeypatch, tmp_path
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        upload_media_to_resource_service,
+    )
+
+    source = tmp_path / "voice.mp3"
+    source.write_bytes(b"abcdef")
+    requested_paths = []
+
+    def handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/check":
+            return httpx.Response(
+                200,
+                json={"code": 200, "result": {"url": "http://objects/whisper/voice"}},
+            )
+        if request.url.path == "/init":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 1,
+                    "result": {
+                        "uploadId": "upload-1",
+                        "url": "http://objects/whisper/voice.mp3",
+                        "urlList": ["http://upload.local/chunk-1"],
+                    },
+                },
+            )
+        if request.url.host == "upload.local":
+            return httpx.Response(200)
+        if request.url.path == "/merge":
+            return httpx.Response(
+                200,
+                json={"code": 1, "url": "http://objects/whisper/voice.mp3"},
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    result = await upload_media_to_resource_service(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="",
+            domain="",
+            chunk_size=10,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/preview",
+            download_origin="",
+        ),
+        source,
+        filename="voice.mp3",
+        content_type=None,
+    )
+
+    assert result == "http://objects/whisper/voice.mp3"
+    assert requested_paths == ["/check", "/init", "/chunk-1", "/merge"]
+
+
+def test_rewrite_media_download_url_replaces_any_http_origin_with_configured_origin():
+    from lightrag.api.media_transcription import MediaResourceConfig, rewrite_media_download_url
+
+    config = MediaResourceConfig(
+        base_url="http://media.local",
+        token="",
+        domain="",
+        chunk_size=3,
+        timeout=10,
+        multipart_check_path="/check",
+        multipart_init_path="/init",
+        multipart_merge_path="/merge",
+        preview_path="/preview",
+        download_origin="http://public-object:19000",
+    )
+
+    assert rewrite_media_download_url(
+        "http://internal-object:19000/whisper/lecture.json?token=1",
+        config,
+    ) == "http://public-object:19000/whisper/lecture.json?token=1"
 
 
 @pytest.mark.parametrize(
@@ -303,8 +564,317 @@ def test_extract_transcription_text_rejects_empty_payload():
         extract_transcription_text({"task_id": "doc-a", "segments": []})
 
 
+@pytest.mark.parametrize(
+    ("media_url", "expected"),
+    [
+        ("http://host/whisper/voice.mp3", "http://host/whisper/voice.json"),
+        (
+            "http://host/whisper/voice.mp3?token=1",
+            "http://host/whisper/voice.json?token=1",
+        ),
+        ("http://host/whisper/voice", "http://host/whisper/voice.json"),
+    ],
+)
+def test_media_url_to_transcription_json_url(media_url, expected):
+    from lightrag.api.media_transcription import media_url_to_transcription_json_url
+
+    assert media_url_to_transcription_json_url(media_url) == expected
+
+
+def test_fetch_transcription_text_from_media_preview_rewrites_down_url(monkeypatch):
+    asyncio.run(_assert_fetch_transcription_text_from_media_preview_rewrites_down_url(monkeypatch))
+
+
+def test_fetch_transcription_text_from_media_preview_preserves_encoded_down_url(
+    monkeypatch,
+):
+    asyncio.run(
+        _assert_fetch_transcription_text_from_media_preview_preserves_encoded_down_url(
+            monkeypatch
+        )
+    )
+
+
+def test_fetch_transcription_text_from_media_preview_reports_download_error_body(
+    monkeypatch,
+):
+    asyncio.run(
+        _assert_fetch_transcription_text_from_media_preview_reports_download_error_body(
+            monkeypatch
+        )
+    )
+
+
+def test_fetch_transcription_text_from_media_preview_retries_unsigned_on_signature_mismatch(
+    monkeypatch,
+):
+    asyncio.run(
+        _assert_fetch_transcription_text_from_media_preview_retries_unsigned_on_signature_mismatch(
+            monkeypatch
+        )
+    )
+
+
+async def _assert_fetch_transcription_text_from_media_preview_rewrites_down_url(
+    monkeypatch,
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        fetch_transcription_text_from_media_preview,
+    )
+
+    requested_urls = []
+
+    def handler(request):
+        requested_urls.append(str(request.url))
+        if request.url.path == "/custom/preview":
+            assert request.url.params["url"] == "http://objects/whisper/lecture.json"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "result": {
+                        "downUrl": (
+                            "http://internal-object:19000/whisper/lecture.json"
+                        )
+                    },
+                },
+            )
+        if str(request.url) == "http://public-object:19000/whisper/lecture.json":
+            return httpx.Response(200, json={"text": "hello rewritten"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    text, json_url = await fetch_transcription_text_from_media_preview(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="",
+            domain="",
+            chunk_size=3,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/custom/preview",
+            download_origin="http://public-object:19000",
+        ),
+        "http://objects/whisper/lecture.mp4",
+    )
+
+    assert text == "hello rewritten"
+    assert json_url == "http://objects/whisper/lecture.json"
+    assert requested_urls == [
+        (
+            "http://media.local/custom/preview?"
+            "url=http%3A%2F%2Fobjects%2Fwhisper%2Flecture.json"
+        ),
+        "http://public-object:19000/whisper/lecture.json",
+    ]
+
+
+async def _assert_fetch_transcription_text_from_media_preview_preserves_encoded_down_url(
+    monkeypatch,
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        fetch_transcription_text_from_media_preview,
+    )
+
+    requested_urls = []
+    encoded_down_url = (
+        "http://internal-object:19000/gfkd/ss/2026/06/24/"
+        "tp%403E7A857311302350CE3A8C40F2864F48.json"
+        "?X-Amz-SignedHeaders=host&X-Amz-Signature=abc"
+    )
+    expected_rewritten_url = (
+        "http://public-object:19000/gfkd/ss/2026/06/24/"
+        "tp%403E7A857311302350CE3A8C40F2864F48.json"
+        "?X-Amz-SignedHeaders=host&X-Amz-Signature=abc"
+    )
+
+    def handler(request):
+        requested_urls.append(str(request.url))
+        if request.url.path == "/custom/preview":
+            return httpx.Response(
+                200,
+                json={"code": 200, "result": {"downUrl": encoded_down_url}},
+            )
+        if str(request.url) == expected_rewritten_url:
+            return httpx.Response(200, json={"text": "encoded ok"})
+        return httpx.Response(403, text="bad canonical request")
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    text, _ = await fetch_transcription_text_from_media_preview(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="",
+            domain="",
+            chunk_size=3,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/custom/preview",
+            download_origin="http://public-object:19000",
+        ),
+        "http://objects/gfkd/ss/2026/06/24/tp@3E7A857311302350CE3A8C40F2864F48.mp3",
+    )
+
+    assert text == "encoded ok"
+    assert requested_urls[1] == expected_rewritten_url
+
+
+async def _assert_fetch_transcription_text_from_media_preview_reports_download_error_body(
+    monkeypatch,
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        MediaResourceError,
+        fetch_transcription_text_from_media_preview,
+    )
+
+    def handler(request):
+        if request.url.path == "/custom/preview":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "result": {
+                        "downUrl": "http://internal-object:19000/gfkd/result.json"
+                    },
+                },
+            )
+        return httpx.Response(
+            403,
+            text="<Error><Code>SignatureDoesNotMatch</Code></Error>",
+        )
+
+
+async def _assert_fetch_transcription_text_from_media_preview_retries_unsigned_on_signature_mismatch(
+    monkeypatch,
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        fetch_transcription_text_from_media_preview,
+    )
+
+    requested_urls = []
+    signed_down_url = (
+        "http://internal-object:19000/gfkd/ss/2026/06/24/"
+        "tp%403E7A857311302350CE3A8C40F2864F48.json"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Signature=bad"
+    )
+    signed_rewritten_url = (
+        "http://public-object:19000/gfkd/ss/2026/06/24/"
+        "tp%403E7A857311302350CE3A8C40F2864F48.json"
+        "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Signature=bad"
+    )
+    unsigned_rewritten_url = (
+        "http://public-object:19000/gfkd/ss/2026/06/24/"
+        "tp%403E7A857311302350CE3A8C40F2864F48.json"
+    )
+
+    def handler(request):
+        requested_urls.append(str(request.url))
+        if request.url.path == "/custom/preview":
+            return httpx.Response(
+                200,
+                json={"code": 200, "result": {"downUrl": signed_down_url}},
+            )
+        if str(request.url) == signed_rewritten_url:
+            return httpx.Response(
+                403,
+                text="<Error><Code>SignatureDoesNotMatch</Code></Error>",
+            )
+        if str(request.url) == unsigned_rewritten_url:
+            return httpx.Response(200, json={"text": "unsigned ok"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    text, _ = await fetch_transcription_text_from_media_preview(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="",
+            domain="",
+            chunk_size=3,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/custom/preview",
+            download_origin="http://public-object:19000",
+        ),
+        "http://objects/gfkd/ss/2026/06/24/tp@3E7A857311302350CE3A8C40F2864F48.mp3",
+    )
+
+    assert text == "unsigned ok"
+    assert requested_urls[1:] == [signed_rewritten_url, unsigned_rewritten_url]
+
+
 def test_enqueue_media_transcription_creates_parsing_status(monkeypatch, tmp_path):
     asyncio.run(_assert_enqueue_media_transcription_creates_parsing_status(monkeypatch, tmp_path))
+
+
+def test_enqueue_media_transcription_requires_media_resource_upload(
+    monkeypatch, tmp_path
+):
+    asyncio.run(
+        _assert_enqueue_media_transcription_requires_media_resource_upload(
+            monkeypatch, tmp_path
+        )
+    )
 
 
 def test_pipeline_enqueue_file_routes_mp3_to_media_transcription(monkeypatch, tmp_path):
@@ -313,6 +883,14 @@ def test_pipeline_enqueue_file_routes_mp3_to_media_transcription(monkeypatch, tm
             monkeypatch, tmp_path
         )
     )
+
+
+def test_media_transcription_uses_unique_task_id_per_enqueue(monkeypatch, tmp_path):
+    asyncio.run(_assert_media_transcription_uses_unique_task_id_per_enqueue(monkeypatch, tmp_path))
+
+
+def test_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path):
+    asyncio.run(_assert_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path))
 
 
 def test_scan_preserves_pending_media_transcription_status(monkeypatch, tmp_path):
@@ -420,15 +998,23 @@ async def _assert_pipeline_enqueue_file_routes_mp3_to_media_transcription(
 
     calls = []
 
+    async def fake_upload(config, file_path, *, filename, content_type):
+        calls.append(("upload", filename, content_type, file_path.read_bytes()))
+        return "http://objects.local/gfkd/voice.mp3"
+
     async def fake_trigger(config, payload):
-        calls.append(payload)
+        calls.append(("trigger", payload))
 
     monkeypatch.setenv(
         "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
     )
     monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
     monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
-    monkeypatch.delenv("GFKD_UPLOAD_BASE_URL", raising=False)
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.upload_media_to_resource_service",
+        fake_upload,
+    )
     monkeypatch.setattr(
         "lightrag.api.media_transcription.trigger_transcription", fake_trigger
     )
@@ -437,18 +1023,126 @@ async def _assert_pipeline_enqueue_file_routes_mp3_to_media_transcription(
     rag = _FakeRag()
     source = tmp_path / "voice.mp3"
     source.write_bytes(b"audio")
-    doc_id = compute_mdhash_id("voice.mp3", prefix="doc-")
 
     success, track_id = await pipeline_enqueue_file(rag, source, "scan-track")
 
+    doc_id = calls[1][1]["task_id"]
     status = await rag.doc_status.get_by_id(doc_id)
     assert success is True
     assert track_id == "scan-track"
     assert status["status"] == DocStatus.PARSING
     assert status["file_path"] == "voice.mp3"
     assert status["metadata"]["media_transcription_status"] == "pending"
-    assert calls[0]["task_id"] == doc_id
+    assert calls[0] == ("upload", "voice.mp3", None, b"audio")
+    assert calls[1][1]["task_id"] == doc_id
+    assert calls[1][1]["url"] == "http://objects.local/gfkd/voice.mp3"
     assert source.exists()
+
+
+async def _assert_media_transcription_uses_unique_task_id_per_enqueue(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.routers.document_routes import pipeline_enqueue_file
+
+    calls = []
+
+    async def fake_upload(config, file_path, *, filename, content_type):
+        return f"http://objects.local/gfkd/{filename}"
+
+    async def fake_trigger(config, payload):
+        calls.append(payload)
+
+    monkeypatch.setenv(
+        "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
+    )
+    monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
+    monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.upload_media_to_resource_service",
+        fake_upload,
+    )
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.trigger_transcription", fake_trigger
+    )
+    monkeypatch.setattr(_dr, "_get_global_args", lambda: SimpleNamespace())
+
+    rag = _FakeRag()
+    source = tmp_path / "voice.mp3"
+    source.write_bytes(b"audio")
+
+    first_success, _ = await pipeline_enqueue_file(rag, source, "scan-track-1")
+    second_success, _ = await pipeline_enqueue_file(rag, source, "scan-track-2")
+
+    assert first_success is True
+    assert second_success is True
+    assert len(calls) == 2
+    assert calls[0]["task_id"] != calls[1]["task_id"]
+    assert await rag.doc_status.get_by_id(calls[0]["task_id"]) is not None
+    assert await rag.doc_status.get_by_id(calls[1]["task_id"]) is not None
+
+
+async def _assert_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_trigger(config, payload):
+        calls.append(payload)
+
+    async def fake_upload(config, file_path, *, filename, content_type):
+        return f"http://objects.local/gfkd/{filename}"
+
+    monkeypatch.setattr(
+        _dr,
+        "_get_router_auth_dependency",
+        lambda api_key=None: (lambda: None),
+    )
+    monkeypatch.setattr(
+        _dr,
+        "_get_global_args",
+        lambda: SimpleNamespace(max_upload_size=100 * 1024 * 1024),
+    )
+    monkeypatch.setenv(
+        "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
+    )
+    monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
+    monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.upload_media_to_resource_service",
+        fake_upload,
+    )
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.trigger_transcription", fake_trigger
+    )
+
+    rag = _FakeRag()
+    doc_manager = DocumentManager(str(tmp_path))
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _dr.UploadFile(filename="voice.mp3", file=BytesIO(b"audio"))
+    upload_file.size = 5
+    bg = _dr.BackgroundTasks()
+
+    response = await upload_endpoint(
+        bg,
+        upload_file,
+        WorkspaceContext("default", rag, doc_manager),
+    )
+
+    assert response.status == "success"
+    assert response.doc_id != compute_mdhash_id("voice.mp3", prefix="doc-")
+    assert len(bg.tasks) == 1
+    for task in bg.tasks:
+        await task.func(*task.args, **task.kwargs)
+
+    assert len(calls) == 1
+    assert response.doc_id == calls[0]["task_id"]
+    assert await rag.doc_status.get_by_id(response.doc_id) is not None
+    assert calls[0]["url"] == "http://objects.local/gfkd/voice.mp3"
 
 
 async def _assert_enqueue_media_transcription_creates_parsing_status(
@@ -458,15 +1152,23 @@ async def _assert_enqueue_media_transcription_creates_parsing_status(
 
     calls = []
 
+    async def fake_upload(config, file_path, *, filename, content_type):
+        calls.append(("upload", filename, content_type, file_path.read_bytes()))
+        return "http://objects.local/gfkd/lecture.mp4"
+
     async def fake_trigger(config, payload):
-        calls.append((config, payload))
+        calls.append(("trigger", config, payload))
 
     monkeypatch.setenv(
         "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
     )
     monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
     monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
-    monkeypatch.delenv("GFKD_UPLOAD_BASE_URL", raising=False)
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.upload_media_to_resource_service",
+        fake_upload,
+    )
     monkeypatch.setattr(
         "lightrag.api.media_transcription.trigger_transcription", fake_trigger
     )
@@ -491,22 +1193,59 @@ async def _assert_enqueue_media_transcription_creates_parsing_status(
     assert status["track_id"] == "upload-track"
     assert status["metadata"]["media_transcription_status"] == "pending"
     assert status["metadata"]["media_source_file"] == "lecture.mp4"
-    assert rag.doc_status.index_done_calls == 1
-    assert calls[0][1]["task_id"] == doc_id
-    assert calls[0][1]["workspace"] == "default"
-    assert (
-        calls[0][1]["url"]
-        == f"http://10.88.88.50:9621/documents/media/files/default/{doc_id}"
+    assert rag.doc_status.index_done_calls == 2
+    assert calls[0] == ("upload", "lecture.mp4", "video/mp4", b"media")
+    assert calls[1][2]["task_id"] == doc_id
+    assert calls[1][2]["workspace"] == "default"
+    assert calls[1][2]["url"] == "http://objects.local/gfkd/lecture.mp4"
+
+
+async def _assert_enqueue_media_transcription_requires_media_resource_upload(
+    monkeypatch, tmp_path
+):
+    from lightrag.api.routers.document_routes import enqueue_media_transcription
+
+    async def fail_if_trigger_called(config, payload):
+        raise AssertionError("transcription must not start without gfkb media URL")
+
+    monkeypatch.setenv(
+        "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
+    )
+    monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
+    monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
+    monkeypatch.delenv("MEDIA_RESOURCE_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.trigger_transcription",
+        fail_if_trigger_called,
     )
 
+    rag = _FakeRag()
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"media")
+    doc_id = compute_mdhash_id("lecture.mp4", prefix="doc-")
 
-def test_enqueue_media_transcription_uses_gfkd_uploaded_url(monkeypatch, tmp_path):
+    await enqueue_media_transcription(
+        rag=rag,
+        file_path=source,
+        canonical_file_path="lecture.mp4",
+        doc_id=doc_id,
+        track_id="upload-track",
+        mime_type="video/mp4",
+    )
+
+    status = await rag.doc_status.get_by_id(doc_id)
+    assert status["status"] == DocStatus.FAILED
+    assert status["metadata"]["media_transcription_status"] == "failed"
+    assert "MEDIA_RESOURCE_BASE_URL" in status["error_msg"]
+
+
+def test_enqueue_media_transcription_uses_media_resource_uploaded_url(monkeypatch, tmp_path):
     asyncio.run(
-        _assert_enqueue_media_transcription_uses_gfkd_uploaded_url(monkeypatch, tmp_path)
+        _assert_enqueue_media_transcription_uses_media_resource_uploaded_url(monkeypatch, tmp_path)
     )
 
 
-async def _assert_enqueue_media_transcription_uses_gfkd_uploaded_url(
+async def _assert_enqueue_media_transcription_uses_media_resource_uploaded_url(
     monkeypatch, tmp_path
 ):
     from lightrag.api.routers.document_routes import enqueue_media_transcription
@@ -518,16 +1257,16 @@ async def _assert_enqueue_media_transcription_uses_gfkd_uploaded_url(
 
     async def fake_upload(config, file_path, *, filename, content_type):
         calls.append(("upload", filename, content_type, file_path.read_bytes()))
-        return "http://192.168.60.143:6692/whisper/lecture.mp4"
+        return "http://objects.local/whisper/lecture.mp4"
 
     monkeypatch.setenv(
         "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
     )
     monkeypatch.setenv("TRANSCRIBE_BUCKET_NAME", "whisper")
     monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
-    monkeypatch.setenv("GFKD_UPLOAD_BASE_URL", "http://127.0.0.1:8498")
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
     monkeypatch.setattr(
-        "lightrag.api.media_transcription.upload_media_to_gfkd", fake_upload
+        "lightrag.api.media_transcription.upload_media_to_resource_service", fake_upload
     )
     monkeypatch.setattr(
         "lightrag.api.media_transcription.trigger_transcription", fake_trigger
@@ -550,10 +1289,10 @@ async def _assert_enqueue_media_transcription_uses_gfkd_uploaded_url(
     status = await rag.doc_status.get_by_id(doc_id)
     assert status["status"] == DocStatus.PARSING
     assert status["metadata"]["media_uploaded_url"] == (
-        "http://192.168.60.143:6692/whisper/lecture.mp4"
+        "http://objects.local/whisper/lecture.mp4"
     )
     assert calls[0] == ("upload", "lecture.mp4", "video/mp4", b"media")
-    assert calls[1][1]["url"] == "http://192.168.60.143:6692/whisper/lecture.mp4"
+    assert calls[1][1]["url"] == "http://objects.local/whisper/lecture.mp4"
 
 
 def test_enqueue_media_transcription_failure_marks_failed(monkeypatch, tmp_path):
@@ -566,11 +1305,18 @@ async def _assert_enqueue_media_transcription_failure_marks_failed(monkeypatch, 
     async def fake_trigger(config, payload):
         raise RuntimeError("transcribe unavailable")
 
+    async def fake_upload(config, file_path, *, filename, content_type):
+        return "http://objects.local/gfkd/lecture.mp4"
+
     monkeypatch.setenv(
         "TRANSCRIBE_ENDPOINT", "http://220.180.237.78:4021/transcribe/async"
     )
     monkeypatch.setenv("LIGHTRAG_PUBLIC_CALLBACK_BASE_URL", "http://10.88.88.50:9621")
-    monkeypatch.delenv("GFKD_UPLOAD_BASE_URL", raising=False)
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.upload_media_to_resource_service",
+        fake_upload,
+    )
     monkeypatch.setattr(
         "lightrag.api.media_transcription.trigger_transcription", fake_trigger
     )
@@ -593,11 +1339,99 @@ async def _assert_enqueue_media_transcription_failure_marks_failed(monkeypatch, 
     assert status["status"] == DocStatus.FAILED
     assert status["metadata"]["media_transcription_status"] == "failed"
     assert status["error_msg"] == "transcribe unavailable"
-    assert rag.doc_status.index_done_calls == 2
+    assert rag.doc_status.index_done_calls == 3
 
 
 def test_apply_media_transcription_callback_success_enqueues_text():
     asyncio.run(_assert_apply_media_transcription_callback_success_enqueues_text())
+
+
+def test_media_transcribe_callback_uses_default_workspace_when_missing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        _dr,
+        "_get_router_auth_dependency",
+        lambda api_key=None: (lambda: None),
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _FakeRag(workspace="default")
+    doc_id = compute_mdhash_id("lecture.mp4", prefix="doc-")
+    asyncio.run(
+        rag.doc_status.upsert(
+            {
+                doc_id: {
+                    "status": DocStatus.PARSING,
+                    "content_summary": "Media transcription pending",
+                    "content_length": 5,
+                    "chunks_count": 0,
+                    "chunks_list": [],
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": "lecture.mp4",
+                    "track_id": "upload-track",
+                    "metadata": {"media_transcription_status": "pending"},
+                }
+            }
+        )
+    )
+    app = FastAPI()
+    app.include_router(create_document_routes(rag, doc_manager, api_key="test-key"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/documents/media/transcribe_callback",
+        headers={"X-API-Key": "test-key"},
+        json={"task_id": doc_id, "text": "hello world"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+    assert rag.full_docs.rows[doc_id]["content"] == "hello world"
+    assert rag.process_calls == 1
+
+
+def test_media_transcribe_callback_uses_workspace_query(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _dr,
+        "_get_router_auth_dependency",
+        lambda api_key=None: (lambda: None),
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _FakeRag(workspace="test")
+    doc_id = compute_mdhash_id("lecture.mp4", prefix="doc-")
+    asyncio.run(
+        rag.doc_status.upsert(
+            {
+                doc_id: {
+                    "status": DocStatus.PARSING,
+                    "content_summary": "Media transcription pending",
+                    "content_length": 5,
+                    "chunks_count": 0,
+                    "chunks_list": [],
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "file_path": "lecture.mp4",
+                    "track_id": "upload-track",
+                    "metadata": {"media_transcription_status": "pending"},
+                }
+            }
+        )
+    )
+    app = FastAPI()
+    app.include_router(create_document_routes(rag, doc_manager, api_key="test-key"))
+    client = TestClient(app)
+
+    response = client.post(
+        "/documents/media/transcribe_callback?workspace=test",
+        headers={"X-API-Key": "test-key"},
+        json={"task_id": doc_id, "text": "hello from query workspace"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "success"}
+    assert rag.full_docs.rows[doc_id]["content"] == "hello from query workspace"
+    assert rag.process_calls == 1
 
 
 async def _assert_apply_media_transcription_callback_success_enqueues_text():
@@ -639,6 +1473,163 @@ async def _assert_apply_media_transcription_callback_success_enqueues_text():
 
 def test_apply_media_transcription_callback_failure_marks_failed():
     asyncio.run(_assert_apply_media_transcription_callback_failure_marks_failed())
+
+
+def test_apply_media_transcription_callback_waiting_status_keeps_parsing():
+    asyncio.run(
+        _assert_apply_media_transcription_callback_waiting_status_keeps_parsing()
+    )
+
+
+def test_apply_media_transcription_callback_success_without_text_records_completion(
+    monkeypatch,
+):
+    asyncio.run(
+        _assert_apply_media_transcription_callback_success_without_text_records_completion(
+            monkeypatch
+        )
+    )
+
+
+def test_apply_media_transcription_callback_success_loads_media_json(monkeypatch):
+    asyncio.run(
+        _assert_apply_media_transcription_callback_success_loads_media_json(monkeypatch)
+    )
+
+
+async def _assert_apply_media_transcription_callback_waiting_status_keeps_parsing():
+    from lightrag.api.routers.document_routes import apply_media_transcription_callback
+
+    rag = _FakeRag()
+    doc_id = compute_mdhash_id("lecture.mp4", prefix="doc-")
+    await rag.doc_status.upsert(
+        {
+            doc_id: {
+                "status": DocStatus.PARSING,
+                "content_summary": "Media transcription pending",
+                "content_length": 5,
+                "chunks_count": 0,
+                "chunks_list": [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "file_path": "lecture.mp4",
+                "track_id": "upload-track",
+                "metadata": {"media_transcription_status": "pending"},
+            }
+        }
+    )
+
+    await apply_media_transcription_callback(
+        rag,
+        {"task_id": doc_id, "status": "processing"},
+    )
+
+    status = await rag.doc_status.get_by_id(doc_id)
+    assert await rag.full_docs.get_by_id(doc_id) is None
+    assert status["status"] == DocStatus.PARSING
+    assert status["metadata"]["media_transcription_status"] == "running"
+    assert status["error_msg"] is None
+    assert rag.doc_status.index_done_calls == 1
+    assert rag.process_calls == 0
+
+
+async def _assert_apply_media_transcription_callback_success_without_text_records_completion(
+    monkeypatch,
+):
+    from lightrag.api.routers.document_routes import apply_media_transcription_callback
+
+    monkeypatch.delenv("MEDIA_RESOURCE_BASE_URL", raising=False)
+    rag = _FakeRag()
+    doc_id = compute_mdhash_id("lecture.mp4", prefix="doc-")
+    await rag.doc_status.upsert(
+        {
+            doc_id: {
+                "status": DocStatus.PARSING,
+                "content_summary": "Media transcription pending",
+                "content_length": 5,
+                "chunks_count": 0,
+                "chunks_list": [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "file_path": "lecture.mp4",
+                "track_id": "upload-track",
+                "metadata": {"media_transcription_status": "pending"},
+            }
+        }
+    )
+
+    await apply_media_transcription_callback(
+        rag,
+        {"task_id": doc_id, "status": "success", "objectName": "test.json"},
+    )
+
+    status = await rag.doc_status.get_by_id(doc_id)
+    assert await rag.full_docs.get_by_id(doc_id) is None
+    assert status["status"] == DocStatus.PARSING
+    assert status["metadata"]["media_transcription_status"] == "completed"
+    assert status["metadata"]["media_transcription_object_name"] == "test.json"
+    assert status["error_msg"] == "Media transcription completed without text payload"
+    assert rag.doc_status.index_done_calls == 1
+    assert rag.process_calls == 0
+
+
+async def _assert_apply_media_transcription_callback_success_loads_media_json(
+    monkeypatch,
+):
+    from lightrag.api.routers.document_routes import apply_media_transcription_callback
+
+    calls = []
+
+    async def fake_fetch(config, media_url):
+        calls.append((config.base_url, media_url))
+        return "hello from media json", "http://host/whisper/lecture.json"
+
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setattr(
+        "lightrag.api.media_transcription.fetch_transcription_text_from_media_preview",
+        fake_fetch,
+    )
+
+    rag = _FakeRag()
+    doc_id = compute_mdhash_id("lecture.mp4", prefix="doc-")
+    await rag.doc_status.upsert(
+        {
+            doc_id: {
+                "status": DocStatus.PARSING,
+                "content_summary": "Media transcription pending",
+                "content_length": 5,
+                "chunks_count": 0,
+                "chunks_list": [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "file_path": "lecture.mp4",
+                "track_id": "upload-track",
+                "metadata": {
+                    "media_transcription_status": "pending",
+                    "media_uploaded_url": "http://host/whisper/lecture.mp4",
+                },
+            }
+        }
+    )
+
+    await apply_media_transcription_callback(
+        rag,
+        {"task_id": doc_id, "status": "success", "objectName": "test.json"},
+    )
+
+    full_doc = await rag.full_docs.get_by_id(doc_id)
+    status = await rag.doc_status.get_by_id(doc_id)
+    assert calls == [("http://media.local", "http://host/whisper/lecture.mp4")]
+    assert full_doc["content"] == "hello from media json"
+    assert status["status"] == DocStatus.PENDING
+    assert status["metadata"]["media_transcription_status"] == "completed"
+    assert status["metadata"]["media_transcription_json_url"] == (
+        "http://host/whisper/lecture.json"
+    )
+    assert status["metadata"]["media_transcription_object_name"] == "test.json"
+    assert status["metadata"]["media_transcription_length"] == 21
+    assert status["error_msg"] is None
+    assert rag.process_calls == 1
 
 
 async def _assert_apply_media_transcription_callback_failure_marks_failed():

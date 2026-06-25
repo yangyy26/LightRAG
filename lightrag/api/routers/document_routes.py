@@ -22,6 +22,7 @@ from fastapi import (
     File,
     HTTPException,
     UploadFile,
+    Query,
 )
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -1172,6 +1173,62 @@ def get_doc_track_id(doc_status: Any) -> str:
     return str(track_id or "")
 
 
+def make_media_transcription_doc_id(canonical_file_path: str, track_id: str) -> str:
+    """Create a unique doc/task id for one media transcription request."""
+    unique_source = f"{canonical_file_path}:{track_id}:{uuid4().hex}"
+    return compute_mdhash_id(unique_source, prefix="doc-")
+
+
+def get_callback_workspace_id(payload: dict[str, Any]) -> str | None:
+    """Read workspace from common callback payload shapes.
+
+    Some transcription services do not echo arbitrary top-level fields from the
+    request payload. When that happens, returning None lets the workspace
+    dependency fall back to the server's default workspace.
+    """
+    for candidate in (
+        payload,
+        payload.get("data") if isinstance(payload.get("data"), dict) else None,
+        payload.get("result") if isinstance(payload.get("result"), dict) else None,
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        value = candidate.get("workspace") or candidate.get("workspace_id")
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def summarize_media_callback_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a log-safe summary for media transcription callback payloads."""
+    summary: dict[str, Any] = {
+        "top_level_keys": sorted(str(key) for key in payload.keys()),
+    }
+    for container_name in ("data", "result"):
+        container = payload.get(container_name)
+        if isinstance(container, dict):
+            summary[f"{container_name}_keys"] = sorted(
+                str(key) for key in container.keys()
+            )
+
+    for candidate_name, candidate in (
+        ("top", payload),
+        ("data", payload.get("data")),
+        ("result", payload.get("result")),
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("text", "transcription", "content", "subtitleText"):
+            value = candidate.get(key)
+            if isinstance(value, str):
+                summary[f"{candidate_name}.{key}_length"] = len(value)
+        for key in ("segments", "subtitle", "subtitles"):
+            value = candidate.get(key)
+            if isinstance(value, list):
+                summary[f"{candidate_name}.{key}_count"] = len(value)
+    return summary
+
+
 async def get_existing_doc_by_file_path_candidates(
     doc_status: Any, file_path: Path | str
 ) -> dict[str, Any] | None:
@@ -1924,7 +1981,7 @@ async def pipeline_enqueue_file(
 
         if media_transcription.is_media_file(file_path):
             canonical_file_path = normalize_file_path(file_path.name)
-            doc_id = compute_mdhash_id(canonical_file_path, prefix="doc-")
+            doc_id = make_media_transcription_doc_id(canonical_file_path, track_id)
             await enqueue_media_transcription(
                 rag=rag,
                 file_path=file_path,
@@ -2445,22 +2502,58 @@ async def enqueue_media_transcription(
     await _upsert_doc_status_and_flush(rag, {doc_id: status_doc})
     uploaded_media_url = None
     try:
-        gfkd_upload_config = media_transcription.load_gfkd_upload_config()
-        if gfkd_upload_config is not None:
-            uploaded_media_url = await media_transcription.upload_media_to_gfkd(
-                gfkd_upload_config,
+        workspace = getattr(rag, "workspace", "") or "default"
+        logger.info(
+            "Preparing media transcription: workspace=%s doc_id=%s file=%s canonical_file=%s file_size=%s mime_type=%s endpoint=%s bucket=%s",
+            workspace,
+            doc_id,
+            file_path.name,
+            canonical_file_path,
+            file_size,
+            mime_type or "",
+            config.endpoint,
+            config.bucket_name,
+        )
+        media_resource_config = media_transcription.load_media_resource_config()
+        if media_resource_config is None:
+            raise media_transcription.TranscriptionConfigError(
+                "MEDIA_RESOURCE_BASE_URL is required for media transcription upload"
+            )
+        logger.info(
+            "Uploading media before transcription: workspace=%s doc_id=%s media_resource_base_url=%s filename=%s",
+            workspace,
+            doc_id,
+            media_resource_config.base_url,
+            canonical_file_path,
+        )
+        uploaded_media_url = (
+            await media_transcription.upload_media_to_resource_service(
+                media_resource_config,
                 file_path,
                 filename=canonical_file_path,
                 content_type=mime_type,
             )
-            status_doc["metadata"]["media_uploaded_url"] = uploaded_media_url
-            await _upsert_doc_status_and_flush(rag, {doc_id: status_doc})
+        )
+        logger.info(
+            "Media upload completed before transcription: workspace=%s doc_id=%s uploaded_media_url=%s",
+            workspace,
+            doc_id,
+            uploaded_media_url,
+        )
+        status_doc["metadata"]["media_uploaded_url"] = uploaded_media_url
+        await _upsert_doc_status_and_flush(rag, {doc_id: status_doc})
 
         payload = media_transcription.build_transcription_payload(
             config,
-            workspace=getattr(rag, "workspace", "") or "default",
+            workspace=workspace,
             doc_id=doc_id,
             media_url=uploaded_media_url,
+        )
+        logger.info(
+            "Built media transcription payload: workspace=%s doc_id=%s payload=%s",
+            workspace,
+            doc_id,
+            payload,
         )
         await media_transcription.trigger_transcription(config, payload)
     except Exception as exc:
@@ -2479,9 +2572,11 @@ async def enqueue_media_transcription(
             },
         )
         logger.error(
-            "Failed to trigger media transcription for %s via %s: %s",
+            "Failed to trigger media transcription for %s via %s bucket=%s uploaded_media_url=%s error=%s",
             canonical_file_path,
             config.endpoint,
+            config.bucket_name,
+            uploaded_media_url,
             str(exc),
         )
 
@@ -2490,14 +2585,37 @@ async def apply_media_transcription_callback(
     rag: "LightRAG", payload: dict[str, Any]
 ) -> None:
     doc_id = media_transcription.callback_task_id(payload)
+    workspace = getattr(rag, "workspace", "") or "default"
+    payload_summary = summarize_media_callback_payload(payload)
+    logger.info(
+        "Media transcription callback processing started: workspace=%s doc_id=%s payload_summary=%s",
+        workspace,
+        doc_id,
+        payload_summary,
+    )
     status_doc = await rag.doc_status.get_by_id(doc_id)
     if not status_doc:
+        logger.error(
+            "Media transcription callback document not found: workspace=%s doc_id=%s payload_summary=%s",
+            workspace,
+            doc_id,
+            payload_summary,
+        )
         raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
 
     metadata = dict(status_doc.get("metadata", {}) or {})
     now = datetime.now(timezone.utc).isoformat()
     file_path = normalize_file_path(status_doc.get("file_path"))
+    logger.info(
+        "Media transcription callback matched document: workspace=%s doc_id=%s status=%s file_path=%s media_status=%s",
+        workspace,
+        doc_id,
+        get_doc_status_value(status_doc),
+        file_path,
+        metadata.get("media_transcription_status"),
+    )
 
+    callback_status = media_transcription.callback_status(payload)
     if media_transcription.callback_failed(payload):
         metadata["media_transcription_status"] = "failed"
         await _upsert_doc_status_and_flush(
@@ -2512,26 +2630,141 @@ async def apply_media_transcription_callback(
                 }
             },
         )
+        logger.warning(
+            "Media transcription callback marked failed: workspace=%s doc_id=%s error=%s",
+            workspace,
+            doc_id,
+            media_transcription.callback_error_message(payload),
+        )
         return
 
-    try:
-        text = media_transcription.extract_transcription_text(payload)
-    except Exception as exc:
-        metadata["media_transcription_status"] = "failed"
+    if media_transcription.callback_waiting(payload):
+        metadata["media_transcription_status"] = callback_status
         await _upsert_doc_status_and_flush(
             rag,
             {
                 doc_id: {
                     **status_doc,
-                    "status": DocStatus.FAILED,
+                    "status": DocStatus.PARSING,
                     "updated_at": now,
-                    "error_msg": str(exc),
+                    "error_msg": None,
                     "metadata": metadata,
                 }
             },
         )
+        logger.info(
+            "Media transcription callback waiting for result: workspace=%s doc_id=%s callback_status=%s payload_summary=%s",
+            workspace,
+            doc_id,
+            callback_status,
+            payload_summary,
+        )
         return
 
+    try:
+        text = media_transcription.extract_transcription_text(payload)
+    except Exception as exc:
+        if callback_status == "success":
+            object_name = str(payload.get("objectName") or "").strip()
+            if object_name:
+                metadata["media_transcription_object_name"] = object_name
+            uploaded_media_url = str(metadata.get("media_uploaded_url") or "").strip()
+            media_resource_config = media_transcription.load_media_resource_config()
+            if media_resource_config is not None and uploaded_media_url:
+                try:
+                    text, json_url = (
+                        await media_transcription.fetch_transcription_text_from_media_preview(
+                            media_resource_config,
+                            uploaded_media_url,
+                        )
+                    )
+                    metadata["media_transcription_json_url"] = json_url
+                except Exception as result_exc:
+                    metadata["media_transcription_status"] = "completed"
+                    await _upsert_doc_status_and_flush(
+                        rag,
+                        {
+                            doc_id: {
+                                **status_doc,
+                                "status": DocStatus.PARSING,
+                                "updated_at": now,
+                                "error_msg": (
+                                    "Media transcription completed but result JSON "
+                                    f"could not be loaded: {result_exc}"
+                                ),
+                                "metadata": metadata,
+                            }
+                        },
+                    )
+                    logger.warning(
+                        "Media transcription callback completed but result JSON could not be loaded: workspace=%s doc_id=%s media_url=%s object_name=%s error=%s payload_summary=%s",
+                        workspace,
+                        doc_id,
+                        uploaded_media_url,
+                        object_name,
+                        str(result_exc),
+                        payload_summary,
+                    )
+                    return
+                logger.info(
+                    "Media transcription callback loaded text from media result JSON: workspace=%s doc_id=%s media_url=%s text_length=%s",
+                    workspace,
+                    doc_id,
+                    uploaded_media_url,
+                    len(text),
+                )
+            else:
+                metadata["media_transcription_status"] = "completed"
+                await _upsert_doc_status_and_flush(
+                    rag,
+                    {
+                        doc_id: {
+                            **status_doc,
+                            "status": DocStatus.PARSING,
+                            "updated_at": now,
+                            "error_msg": "Media transcription completed without text payload",
+                            "metadata": metadata,
+                        }
+                    },
+                )
+                logger.warning(
+                    "Media transcription callback completed without text payload: workspace=%s doc_id=%s object_name=%s payload_summary=%s",
+                    workspace,
+                    doc_id,
+                    object_name,
+                    payload_summary,
+                )
+                return
+
+        else:
+            metadata["media_transcription_status"] = "failed"
+            await _upsert_doc_status_and_flush(
+                rag,
+                {
+                    doc_id: {
+                        **status_doc,
+                        "status": DocStatus.FAILED,
+                        "updated_at": now,
+                        "error_msg": str(exc),
+                        "metadata": metadata,
+                    }
+                },
+            )
+            logger.error(
+                "Media transcription callback text extraction failed: workspace=%s doc_id=%s error=%s payload_summary=%s",
+                workspace,
+                doc_id,
+                str(exc),
+                payload_summary,
+            )
+            return
+
+    logger.info(
+        "Media transcription callback extracted text: workspace=%s doc_id=%s text_length=%s",
+        workspace,
+        doc_id,
+        len(text),
+    )
     metadata["media_transcription_status"] = "completed"
     metadata["media_transcription_length"] = len(text)
     await rag.full_docs.upsert(
@@ -2561,6 +2794,12 @@ async def apply_media_transcription_callback(
         },
     )
     await rag.apipeline_process_enqueue_documents()
+    logger.info(
+        "Media transcription callback completed and queued document: workspace=%s doc_id=%s file_path=%s",
+        workspace,
+        doc_id,
+        file_path,
+    )
 
 
 async def _upsert_doc_status_and_flush(
@@ -3642,7 +3881,12 @@ def create_document_routes(
 
             track_id = generate_track_id("upload")
             upload_file_path = normalize_file_path(safe_filename)
-            upload_doc_id = compute_mdhash_id(upload_file_path, prefix="doc-")
+            if media_transcription.is_media_file(file_path):
+                upload_doc_id = make_media_transcription_doc_id(
+                    upload_file_path, track_id
+                )
+            else:
+                upload_doc_id = compute_mdhash_id(upload_file_path, prefix="doc-")
             upload_root_id = f"resource:{upload_doc_id}"
 
             # Bg task: enqueue + trigger processing, then release the slot.
@@ -4938,15 +5182,45 @@ def create_document_routes(
     @router.post("/media/transcribe_callback")
     async def media_transcribe_callback(
         payload: dict[str, Any],
+        workspace: str | None = Query(default=None),
     ):
-        workspace_id = str(payload.get("workspace") or "").strip()
-        if not workspace_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing workspace in transcription callback",
+        workspace_id = str(workspace or "").strip() or get_callback_workspace_id(
+            payload
+        )
+        payload_summary = summarize_media_callback_payload(payload)
+        try:
+            doc_id_for_log = media_transcription.callback_task_id(payload)
+        except Exception as exc:
+            doc_id_for_log = None
+            logger.error(
+                "Media transcription callback missing task id: query_workspace=%s body_workspace=%s error=%s payload_summary=%s",
+                workspace,
+                get_callback_workspace_id(payload),
+                str(exc),
+                payload_summary,
             )
+
+        logger.info(
+            "Media transcription callback received: query_workspace=%s body_workspace=%s resolved_workspace=%s doc_id=%s payload_summary=%s",
+            workspace,
+            get_callback_workspace_id(payload),
+            workspace_id or "<default>",
+            doc_id_for_log,
+            payload_summary,
+        )
         context = await _require_workspace_context(workspace_id)
-        await apply_media_transcription_callback(context.rag, payload)
+        try:
+            await apply_media_transcription_callback(context.rag, payload)
+        except HTTPException as exc:
+            logger.error(
+                "Media transcription callback failed: resolved_workspace=%s context_workspace=%s doc_id=%s status_code=%s detail=%s",
+                workspace_id or "<default>",
+                getattr(context, "workspace_id", None),
+                doc_id_for_log,
+                exc.status_code,
+                exc.detail,
+            )
+            raise
         return {"status": "success"}
 
     return router

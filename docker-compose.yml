@@ -6,6 +6,8 @@ services:
       dockerfile: Dockerfile
       tags:
         - lightrag-local:workspace
+    env_file:
+      - .env
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
     volumes:
