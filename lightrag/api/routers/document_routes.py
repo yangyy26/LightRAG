@@ -13,6 +13,7 @@ import aiofiles
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Literal
 from io import BytesIO
 from fastapi import (
@@ -30,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from lightrag.api import media_transcription
 from lightrag.api.workspace import WorkspaceContext
 from lightrag.base import DocProcessingStatus, DocStatus
+from lightrag.utils_callback import _validate_callback_url
 from lightrag.constants import (
     FULL_DOCS_FORMAT_PENDING_PARSE,
     FULL_DOCS_FORMAT_RAW,
@@ -1016,7 +1018,9 @@ class DocumentManager:
             ".pdf",
             ".doc",
             ".docx",
+            ".ppt",
             ".pptx",
+            ".xls",
             ".xlsx",
             ".rtf",  # Rich Text Format
             ".odt",  # OpenDocument Text
@@ -1560,6 +1564,20 @@ def delete_file_variants_by_file_path(
     if canonical == UNKNOWN_FILE_SOURCE:
         return [], []
     canonical_names = {canonical}
+    
+    # Add original legacy Office file names for conversion scenarios
+    # e.g., if file_path is "document.pptx", also look for "document.ppt"
+    # This ensures deleting both converted and original files
+    path_obj = Path(file_path)
+    if path_obj.suffix.lower() in _CONVERTED_FORMAT_PARSE_ENGINE:
+        # This is a converted file (.docx/.pptx/.xlsx)
+        # Add possible original legacy extensions
+        for orig_ext, (_, _, out_suffix) in _LEGACY_OFFICE_CONVERSION_MAP.items():
+            if out_suffix == path_obj.suffix.lower():
+                # Found matching conversion: e.g., .ppt → .pptx
+                original_name = normalize_file_path(f"{path_obj.stem}{orig_ext}")
+                canonical_names.add(original_name)
+                break
 
     deleted_files: list[str] = []
     errors: list[str] = []
@@ -1906,20 +1924,49 @@ class DocConversionError(RuntimeError):
     pass
 
 
+# Maps legacy Office extension → (MIME type, target format, output suffix)
+_LEGACY_OFFICE_CONVERSION_MAP: dict[str, tuple[str, str, str]] = {
+    ".doc": ("application/msword", "docx", ".docx"),
+    ".ppt": ("application/vnd.ms-powerpoint", "pptx", ".pptx"),
+    ".xls": ("application/vnd.ms-excel", "xlsx", ".xlsx"),
+}
+
+# Set of legacy extensions that require conversion before parsing
+_LEGACY_OFFICE_EXTENSIONS: frozenset[str] = frozenset(
+    _LEGACY_OFFICE_CONVERSION_MAP.keys()
+)
+
+# Parse engine to use for each converted OpenXML format suffix
+_CONVERTED_FORMAT_PARSE_ENGINE: dict[str, str] = {
+    ".docx": PARSER_ENGINE_NATIVE,
+    ".pptx": PARSER_ENGINE_LEGACY,
+    ".xlsx": PARSER_ENGINE_LEGACY,
+}
+
+
 async def _convert_doc_to_docx(file_path: Path) -> Path:
+    ext = file_path.suffix.lower()
+    conversion = _LEGACY_OFFICE_CONVERSION_MAP.get(ext)
+    if conversion is None:
+        raise DocConversionError(f"No conversion mapping for extension {ext!r}")
+
+    mime_type, target_fmt, out_suffix = conversion
+
     endpoint = os.getenv("DOC_CONVERT_ENDPOINT", "").strip()
     if not endpoint:
         raise DocConversionError(
-            "DOC conversion is not configured. Set DOC_CONVERT_ENDPOINT to a "
-            "LibreOffice-compatible conversion service."
+            "Legacy Office conversion is not configured. "
+            "Set DOC_CONVERT_ENDPOINT to a LibreOffice-compatible conversion service."
         )
 
     try:
         import httpx
     except ImportError as exc:
-        raise DocConversionError("httpx is required for DOC conversion") from exc
+        raise DocConversionError(
+            "httpx is required for legacy Office conversion"
+        ) from exc
 
-    converted_path = file_path.with_suffix(".docx")
+    converted_path = file_path.with_suffix(out_suffix)
     timeout = float(os.getenv("DOC_CONVERT_TIMEOUT", "120"))
     async with httpx.AsyncClient(timeout=timeout) as client:
         with file_path.open("rb") as file_obj:
@@ -1929,15 +1976,17 @@ async def _convert_doc_to_docx(file_path: Path) -> Path:
                     "file": (
                         file_path.name,
                         file_obj,
-                        "application/msword",
+                        mime_type,
                     )
                 },
-                data={"target": "docx"},
+                data={"target": target_fmt},
             )
     response.raise_for_status()
     converted_path.write_bytes(response.content)
     if converted_path.stat().st_size == 0:
-        raise DocConversionError("DOC conversion returned an empty DOCX file")
+        raise DocConversionError(
+            f"Legacy Office conversion returned an empty {out_suffix!r} file"
+        )
     return converted_path
 
 
@@ -2012,62 +2061,87 @@ async def pipeline_enqueue_file(
             return False, track_id
 
         api_process_options = process_options or PROCESS_OPTION_CHUNK_FIXED
-        if ext == ".doc":
+        if ext in _LEGACY_OFFICE_EXTENSIONS:
+            conv_info = _LEGACY_OFFICE_CONVERSION_MAP[ext]
+            _, _, out_suffix = conv_info
+            upper_ext = ext.upper().lstrip(".")
+            upper_suffix = out_suffix.upper().lstrip(".")
             try:
-                converted_docx = await _convert_doc_to_docx(file_path)
+                converted_file = await _convert_doc_to_docx(file_path)
             except Exception as e:
                 error_files = [
                     {
                         "file_path": str(file_path.name),
-                        "error_description": "[File Extraction]DOC conversion error",
-                        "original_error": f"Failed to convert DOC to DOCX: {str(e)}",
-                        "file_size": file_size,
-                    }
-                ]
-                await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                logger.error(
-                    f"[File Extraction]Error converting DOC {file_path.name}: {str(e)}"
-                )
-                return False, track_id
-
-            try:
-                enqueue_result = await rag.apipeline_enqueue_documents(
-                    "",
-                    file_paths=str(converted_docx),
-                    track_id=track_id,
-                    docs_format=FULL_DOCS_FORMAT_PENDING_PARSE,
-                    parse_engine=PARSER_ENGINE_NATIVE,
-                    process_options=api_process_options,
-                    from_scan=from_scan,
-                )
-                if enqueue_result is None:
-                    try:
-                        await move_file_to_parsed_dir(converted_docx)
-                    except Exception as move_error:
-                        logger.error(
-                            f"Failed to move duplicate file {converted_docx.name} to {PARSED_DIR_NAME} directory: {move_error}"
-                        )
-                    return False, track_id
-                logger.info(
-                    f"[File Extraction]Converted {file_path.name} to {converted_docx.name} and deferred to native parser"
-                )
-                return True, track_id
-            except Exception as e:
-                error_files = [
-                    {
-                        "file_path": str(file_path.name),
-                        "error_description": "[File Extraction]Converted DOC enqueue error",
+                        "error_description": (
+                            f"[File Extraction]{upper_ext} conversion error"
+                        ),
                         "original_error": (
-                            f"Failed to enqueue converted DOCX for parser: {str(e)}"
+                            f"Failed to convert {upper_ext} to {upper_suffix}: {str(e)}"
                         ),
                         "file_size": file_size,
                     }
                 ]
                 await rag.apipeline_enqueue_error_documents(error_files, track_id)
                 logger.error(
-                    f"[File Extraction]Error enqueuing converted DOC {file_path.name}: {str(e)}"
+                    f"[File Extraction]Error converting {upper_ext} {file_path.name}: {str(e)}"
                 )
                 return False, track_id
+
+            # For .ppt/.xls conversion, replace file_path with converted file
+            # and continue to legacy processing path (same as direct .pptx/.xlsx upload)
+            if out_suffix == ".docx":
+                # .doc → .docx: route to native parser (existing behavior)
+                try:
+                    doc_canonical_path = normalize_file_path(str(file_path))
+                    doc_doc_id = compute_mdhash_id(doc_canonical_path, prefix="doc-")
+                    enqueue_result = await rag.apipeline_enqueue_documents(
+                        "",
+                        file_paths=str(converted_file),
+                        ids=[doc_doc_id],
+                        track_id=track_id,
+                        docs_format=FULL_DOCS_FORMAT_PENDING_PARSE,
+                        parse_engine=PARSER_ENGINE_NATIVE,
+                        process_options=api_process_options,
+                        from_scan=from_scan,
+                    )
+                    if enqueue_result is None:
+                        try:
+                            await move_file_to_parsed_dir(converted_file)
+                        except Exception as move_error:
+                            logger.error(
+                                f"Failed to move duplicate file {converted_file.name} to "
+                                f"{PARSED_DIR_NAME} directory: {move_error}"
+                            )
+                        return False, track_id
+                    logger.info(
+                        f"[File Extraction]Converted {file_path.name} to "
+                        f"{converted_file.name} and deferred to native parser"
+                    )
+                    return True, track_id
+                except Exception as e:
+                    error_files = [
+                        {
+                            "file_path": str(file_path.name),
+                            "error_description": (
+                                f"[File Extraction]Converted {upper_ext} enqueue error"
+                            ),
+                            "original_error": (
+                                f"Failed to enqueue converted {upper_suffix} "
+                                f"for parser: {str(e)}"
+                            ),
+                            "file_size": file_size,
+                        }
+                    ]
+                    await rag.apipeline_enqueue_error_documents(error_files, track_id)
+                    logger.error(
+                        f"[File Extraction]Error enqueuing converted {upper_ext} "
+                        f"{file_path.name}: {str(e)}"
+                    )
+                    return False, track_id
+            else:
+                file_path = converted_file
+                ext = file_path.suffix.lower()
+                extraction_engine = PARSER_ENGINE_LEGACY
 
         if extraction_engine != PARSER_ENGINE_LEGACY:
             try:
@@ -3683,6 +3757,7 @@ def create_document_routes(
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
         context: WorkspaceContext = Depends(workspace_dependency),
+        callback_url: str | None = Query(None, description="HTTP(S) URL called after hierarchy generation completes"),
     ):
         """
         Upload a file to the input directory and index it.
@@ -3760,6 +3835,12 @@ def create_document_routes(
         rag = context.rag
         doc_manager = context.doc_manager
         slot_reserved = False
+
+        if callback_url is not None:
+            err = _validate_callback_url(callback_url)
+            if err is not None:
+                raise HTTPException(status_code=400, detail=err)
+
         try:
             # Reject upload while a scan is in its CLASSIFICATION
             # phase or a destructive job (clear / per-doc delete) is
@@ -3910,6 +3991,29 @@ def create_document_routes(
                         )
                     else:
                         await pipeline_index_file(rag, file_path, track_id)
+
+                    if callback_url is not None:
+                        try:
+                            docs = await rag.doc_status.get_docs_by_track_id(track_id)
+                            if docs:
+                                updated: dict[str, dict] = {}
+                                for doc_id_str, doc in docs.items():
+                                    status_dict = (
+                                        doc.to_dict()
+                                        if hasattr(doc, "to_dict")
+                                        else asdict(doc)
+                                    )
+                                    metadata = status_dict.get("metadata") or {}
+                                    if isinstance(metadata, dict):
+                                        metadata["callback_url"] = callback_url.strip()
+                                    else:
+                                        metadata = {"callback_url": callback_url.strip()}
+                                    status_dict["metadata"] = metadata
+                                    updated[doc_id_str] = status_dict
+                                if updated:
+                                    await rag.doc_status.upsert(updated)
+                        except Exception:
+                            logger.exception("Failed to store callback_url in doc_status for track %s", track_id)
                 finally:
                     await _release_enqueue_slot(rag)
 

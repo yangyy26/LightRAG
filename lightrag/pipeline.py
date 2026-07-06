@@ -421,6 +421,9 @@ class _PipelineMixin:
                 file_path=file_path,
                 message=f"Knowledge hierarchy completed for `{file_path}`",
             )
+            await self._try_fire_hierarchy_callback(
+                doc_id=doc_id,
+            )
         except Exception as hierarchy_error:
             error_message = str(hierarchy_error).strip()
             if not error_message:
@@ -441,6 +444,35 @@ class _PipelineMixin:
                 doc_id=doc_id,
                 file_path=file_path,
                 message=f"Knowledge hierarchy failed for `{file_path}`: {error_message}",
+            )
+            await self._try_fire_hierarchy_callback(
+                doc_id=doc_id,
+            )
+
+    async def _try_fire_hierarchy_callback(
+        self,
+        *,
+        doc_id: str,
+    ) -> None:
+        """Notify an external callback URL (if configured) about hierarchy build results."""
+        try:
+            status_doc = await self.doc_status.get_by_id(doc_id)
+            metadata = (
+                status_doc.get("metadata", {})
+                if isinstance(status_doc, dict)
+                else (getattr(status_doc, "metadata", None) or {})
+            )
+            callback_url = metadata.get("callback_url") if isinstance(metadata, dict) else None
+            if not callback_url:
+                return
+
+            from lightrag.utils_callback import send_hierarchy_callback
+
+            # Fire-and-forget — do not block the pipeline
+            asyncio.create_task(send_hierarchy_callback(callback_url, doc_id))
+        except Exception:
+            logger.exception(
+                "Failed to fire hierarchy callback for doc %s", doc_id
             )
 
     async def _augment_hierarchy_chunk_results_from_graph(
@@ -949,6 +981,14 @@ class _PipelineMixin:
                     FULL_DOCS_FORMAT_LIGHTRAG,
                     sidecar_location=sidecar_location,
                 )
+        elif docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
+            # 为保持文档转换前后id一致，会提前传入id，所以将此分支提前
+            for i, doc in enumerate(input):
+                _add_content(
+                    i,
+                    doc or "",
+                    FULL_DOCS_FORMAT_PENDING_PARSE,
+                    )
         elif ids is not None:
             for i, doc in enumerate(input):
                 cleaned_content = sanitize_text_for_encoding(doc)
@@ -956,13 +996,6 @@ class _PipelineMixin:
                     i,
                     cleaned_content,
                     FULL_DOCS_FORMAT_RAW,
-                )
-        elif docs_format == FULL_DOCS_FORMAT_PENDING_PARSE:
-            for i, doc in enumerate(input):
-                _add_content(
-                    i,
-                    doc or "",
-                    FULL_DOCS_FORMAT_PENDING_PARSE,
                 )
         else:
             for i, doc in enumerate(input):
