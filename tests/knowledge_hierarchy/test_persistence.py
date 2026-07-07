@@ -130,6 +130,46 @@ async def test_persist_resource_knowledge_hierarchy_skips_edges_with_missing_end
 
 
 @pytest.mark.asyncio
+async def test_persist_resource_knowledge_hierarchy_clears_stale_edges_when_empty():
+    root = HierarchyNode(
+        entity_id="resource:doc-a",
+        entity_name="trees.pdf",
+        entity_type="Resource",
+        description="trees.pdf",
+        source_id="",
+        file_path="trees.pdf",
+        hierarchy_kind="root",
+        root_id="resource:doc-a",
+        parent_id=None,
+        level=0,
+    )
+    hierarchy = NormalizedHierarchy(root=root, edges=[])
+    graph = AsyncMock()
+    graph.get_all_edges.return_value = [
+        {
+            "source": "resource:doc-a",
+            "target": "Old Child",
+            "edge_type": "hierarchy",
+            "root_id": "resource:doc-a",
+        },
+        {
+            "source": "resource:doc-b",
+            "target": "Other Child",
+            "edge_type": "hierarchy",
+            "root_id": "resource:doc-b",
+        },
+    ]
+    entity_vdb = AsyncMock()
+
+    persisted = await persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb)
+
+    assert persisted is False
+    graph.remove_edges.assert_awaited_once_with([("resource:doc-a", "Old Child")])
+    graph.upsert_nodes_batch.assert_not_awaited()
+    graph.upsert_edges_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_legacy_hierarchy_duplicates_removes_old_kp_nodes_and_vdb():
     graph = AsyncMock()
     graph.get_all_nodes.return_value = [

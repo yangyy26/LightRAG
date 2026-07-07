@@ -38,6 +38,8 @@ def test_knowledge_hierarchy_is_enabled_by_default_without_type_filter():
     assert rag.hierarchy_max_rounds == 2
     assert rag.hierarchy_parent_candidate_limit == 40
     assert rag.hierarchy_min_parent_confidence == 0.6
+    assert rag.hierarchy_enable_semantic_candidate_filter is True
+    assert rag.hierarchy_enable_hard_candidate_filter is True
     assert rag.hierarchy_max_parallel_batches == 3
     assert rag.hierarchy_candidate_entity_types == []
 
@@ -50,6 +52,8 @@ def test_knowledge_hierarchy_config_is_in_global_config():
         hierarchy_max_rounds=4,
         hierarchy_parent_candidate_limit=12,
         hierarchy_min_parent_confidence=0.7,
+        hierarchy_enable_semantic_candidate_filter=False,
+        hierarchy_enable_hard_candidate_filter=False,
         hierarchy_max_parallel_batches=2,
         hierarchy_candidate_entity_types=["Concept", "Skill"],
     )
@@ -62,6 +66,8 @@ def test_knowledge_hierarchy_config_is_in_global_config():
     assert config["hierarchy_max_rounds"] == 4
     assert config["hierarchy_parent_candidate_limit"] == 12
     assert config["hierarchy_min_parent_confidence"] == 0.7
+    assert config["hierarchy_enable_semantic_candidate_filter"] is False
+    assert config["hierarchy_enable_hard_candidate_filter"] is False
     assert config["hierarchy_max_parallel_batches"] == 2
     assert config["hierarchy_candidate_entity_types"] == ["concept", "skill"]
 

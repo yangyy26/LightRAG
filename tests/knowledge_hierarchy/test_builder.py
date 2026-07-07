@@ -6,10 +6,12 @@ import pytest
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.knowledge_hierarchy import (
     ParentAssignment,
+    _build_parent_assignment_prompt,
     assign_parents_from_relations,
     build_chunk_results_from_resource_graph,
     build_resource_knowledge_hierarchy,
     collect_hierarchy_candidates,
+    filter_hierarchy_candidates_by_hard_rules,
     filter_hierarchy_candidates_by_grounding,
     normalize_assignments_to_hierarchy,
     normalize_hierarchy_tree,
@@ -133,6 +135,30 @@ def test_candidate_grounding_filters_names_absent_from_current_document():
     assert set(filtered) == {"verified resource title: norms, theory, and values"}
 
 
+def test_hard_candidate_filter_removes_obvious_non_knowledge_names():
+    candidates = _candidate_map("课时01", "2017年1月3日", "2024-01-03", "123")
+
+    filtered = filter_hierarchy_candidates_by_hard_rules(candidates)
+
+    assert filtered == {}
+
+
+def test_hard_candidate_filter_keeps_numbered_real_concepts():
+    candidates = _candidate_map("二叉树", "HTTP 2", "第3范式")
+
+    filtered = filter_hierarchy_candidates_by_hard_rules(candidates)
+
+    assert set(filtered) == {"二叉树", "http 2", "第3范式"}
+
+
+def test_hard_candidate_filter_keeps_cjk_single_character_concepts():
+    candidates = _candidate_map("熵", "力")
+
+    filtered = filter_hierarchy_candidates_by_hard_rules(candidates)
+
+    assert set(filtered) == {"熵", "力"}
+
+
 @pytest.mark.asyncio
 async def test_resource_graph_chunk_results_trim_merged_node_to_current_doc_chunks():
     class FakeGraph:
@@ -216,6 +242,27 @@ def test_parse_parent_assignments_accepts_valid_json_list():
     assert assignments[1].parent is None
 
 
+def test_parse_parent_assignments_accepts_decision_field():
+    assignments = parse_parent_assignments(
+        {
+            "assignments": [
+                {
+                    "child": "课时01",
+                    "parent": None,
+                    "confidence": 0.99,
+                    "decision": "reject",
+                    "reason": "课时标记，不是知识点",
+                }
+            ]
+        }
+    )
+
+    assert assignments[0].child == "课时01"
+    assert assignments[0].parent is None
+    assert assignments[0].confidence == 0.99
+    assert assignments[0].decision == "reject"
+
+
 def test_parse_parent_assignments_ignores_invalid_rows():
     assignments = parse_parent_assignments(
         {
@@ -254,6 +301,109 @@ def test_normalize_assignments_covers_all_candidates_and_roots_unassigned():
         ("Parent", "Child"),
         ("resource:doc-a", "Orphan"),
     }
+
+
+def test_normalize_assignments_removes_semantically_rejected_candidates():
+    candidates = _candidate_map("二叉树", "课时01")
+    hierarchy = normalize_assignments_to_hierarchy(
+        root_id="resource:doc-a",
+        root_title="trees.pdf",
+        file_path="trees.pdf",
+        candidates=candidates,
+        assignments=[
+            ParentAssignment(
+                child="课时01",
+                parent=None,
+                confidence=0.99,
+                decision="reject",
+                reason="课时标记，不是知识点",
+            )
+        ],
+        max_depth=5,
+        min_confidence=0.6,
+    )
+
+    edge_children = {target for _source, target, _data in hierarchy.edges}
+    assert edge_children == {"二叉树"}
+
+
+def test_normalize_assignments_keeps_missing_decision_as_root_candidate():
+    candidates = _candidate_map("二叉树")
+    hierarchy = normalize_assignments_to_hierarchy(
+        root_id="resource:doc-a",
+        root_title="trees.pdf",
+        file_path="trees.pdf",
+        candidates=candidates,
+        assignments=[
+            ParentAssignment(
+                child="二叉树",
+                parent=None,
+                confidence=0.2,
+            )
+        ],
+        max_depth=5,
+        min_confidence=0.6,
+    )
+
+    assert len(hierarchy.edges) == 1
+    assert hierarchy.edges[0][1] == "二叉树"
+
+
+def test_normalize_assignments_treats_root_decision_with_parent_as_root():
+    candidates = _candidate_map("Parent", "Child")
+    hierarchy = normalize_assignments_to_hierarchy(
+        root_id="resource:doc-a",
+        root_title="doc.pdf",
+        file_path="doc.pdf",
+        candidates=candidates,
+        assignments=[
+            ParentAssignment(
+                child="Child",
+                parent="Parent",
+                confidence=0.99,
+                decision="root",
+            )
+        ],
+        max_depth=5,
+        min_confidence=0.6,
+    )
+
+    edge_by_child = {target: source for source, target, _data in hierarchy.edges}
+    assert edge_by_child["Child"] == "resource:doc-a"
+
+
+def test_parent_assignment_prompt_includes_reject_decisions():
+    candidates = _candidate_map("二叉树", "课时01")
+
+    prompt = _build_parent_assignment_prompt(
+        root_title="trees.pdf",
+        children=[candidates["二叉树"]],
+        parent_candidates=[candidates["二叉树"]],
+        relations=[],
+        current_assignments=[
+            ParentAssignment(
+                child="课时01",
+                parent=None,
+                confidence=0.99,
+                decision="reject",
+                reason="课时标记，不是知识点",
+            )
+        ],
+    )
+
+    current_assignments_json = prompt.split("Current Assignments JSON:\n", 1)[1].split(
+        "\nParent Assignment JSON:",
+        1,
+    )[0]
+
+    assert json.loads(current_assignments_json) == [
+        {
+            "child": "课时01",
+            "parent": None,
+            "confidence": 0.99,
+            "decision": "reject",
+        }
+    ]
 
 
 def test_normalize_assignments_rejects_cycles_and_low_confidence():
@@ -791,6 +941,125 @@ async def test_build_resource_knowledge_hierarchy_calls_llm_and_normalizes_json(
 
 
 @pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_keeps_low_frequency_candidates():
+    async def fake_llm(prompt: str, **_kwargs):
+        return {
+            "assignments": [
+                {
+                    "child": "二叉树",
+                    "parent": None,
+                    "confidence": 0.8,
+                    "decision": "root",
+                    "reason": "valid concept",
+                },
+                {
+                    "child": "红黑树",
+                    "parent": None,
+                    "confidence": 0.8,
+                    "decision": "root",
+                    "reason": "valid concept even when mentioned once",
+                }
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "二叉树": [
+                    {
+                        "entity_name": "二叉树",
+                        "entity_type": "concept",
+                        "description": "二叉树知识点",
+                        "source_id": "chunk-a",
+                        "file_path": "trees.pdf",
+                    }
+                ],
+                "红黑树": [
+                    {
+                        "entity_name": "红黑树",
+                        "entity_type": "concept",
+                        "description": "低频知识点",
+                        "source_id": "chunk-a",
+                        "file_path": "trees.pdf",
+                    }
+                ],
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="trees.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["concept"],
+            "hierarchy_enable_hard_candidate_filter": True,
+            "hierarchy_enable_semantic_candidate_filter": True,
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="二叉树是一种树。二叉树可以递归遍历。二叉树常用于搜索。红黑树只出现一次。",
+    )
+
+    assert hierarchy is not None
+    assert {target for _source, target, _data in hierarchy.edges} == {"二叉树", "红黑树"}
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_applies_hard_filter_before_llm():
+    captured_prompts = []
+
+    async def fake_llm(prompt: str, **_kwargs):
+        captured_prompts.append(prompt)
+        return {"assignments": []}
+
+    chunk_results = [
+        (
+            {
+                "二叉树": [
+                    {
+                        "entity_name": "二叉树",
+                        "entity_type": "concept",
+                        "description": "二叉树知识点",
+                        "source_id": "chunk-a",
+                        "file_path": "trees.pdf",
+                    }
+                ],
+                "课时01": [
+                    {
+                        "entity_name": "课时01",
+                        "entity_type": "concept",
+                        "description": "课时标记",
+                        "source_id": "chunk-b",
+                        "file_path": "trees.pdf",
+                    }
+                ],
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="trees.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["concept"],
+            "hierarchy_enable_hard_candidate_filter": True,
+            "hierarchy_enable_semantic_candidate_filter": True,
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="二叉树 课时01",
+    )
+
+    assert hierarchy is not None
+    assert "课时01" not in captured_prompts[0]
+    assert {target for _source, target, _data in hierarchy.edges} == {"二叉树"}
+
+
+@pytest.mark.asyncio
 async def test_build_resource_knowledge_hierarchy_includes_extracted_relations_in_prompt():
     captured = {}
 
@@ -1035,6 +1304,338 @@ async def test_build_resource_knowledge_hierarchy_batches_all_candidates():
     assert ("Concept 2", "Concept 3") in edge_pairs
     assert ("resource:doc-a", "Concept 4") in edge_pairs
     assert any("Parent Assignment JSON" in prompt for prompt in prompts)
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_does_not_retry_rejected_candidates():
+    prompts = []
+
+    async def fake_llm(prompt: str, **_kwargs):
+        prompts.append(prompt)
+        if len(prompts) > 1:
+            return {"assignments": []}
+        return {
+            "assignments": [
+                {
+                    "child": "课时01",
+                    "parent": None,
+                    "confidence": 0.99,
+                    "decision": "reject",
+                    "reason": "课时标记，不是知识点",
+                },
+                {
+                    "child": "二叉树",
+                    "parent": "树",
+                    "confidence": 0.9,
+                    "decision": "assign",
+                    "reason": "二叉树是一种树",
+                },
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "课时01": [
+                    {
+                        "entity_name": "课时01",
+                        "entity_type": "concept",
+                        "description": "课时标记",
+                        "source_id": "chunk-a",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+                "树": [
+                    {
+                        "entity_name": "树",
+                        "entity_type": "concept",
+                        "description": "树结构",
+                        "source_id": "chunk-b",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+                "二叉树": [
+                    {
+                        "entity_name": "二叉树",
+                        "entity_type": "concept",
+                        "description": "二叉树知识点",
+                        "source_id": "chunk-c",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="doc.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["concept"],
+            "hierarchy_enable_hard_candidate_filter": False,
+            "hierarchy_enable_semantic_candidate_filter": True,
+            "hierarchy_max_rounds": 2,
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="课时01 课时01 课时01 树 二叉树",
+    )
+
+    assert hierarchy is not None
+    edge_children = {target for _source, target, _data in hierarchy.edges}
+    assert edge_children == {"树", "二叉树"}
+    assert len(prompts) == 2
+
+    second_unresolved_json = prompts[1].split("Unresolved Children JSON:\n", 1)[
+        1
+    ].split("\nParent Candidates JSON:", 1)[0]
+    second_unresolved_names = {
+        item["name"] for item in json.loads(second_unresolved_json)
+    }
+    assert "课时01" not in second_unresolved_names
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_ignores_reject_when_semantic_filter_disabled():
+    prompts = []
+
+    async def fake_llm(prompt: str, **_kwargs):
+        prompts.append(prompt)
+        return {
+            "assignments": [
+                {
+                    "child": "课时01",
+                    "parent": None,
+                    "confidence": 0.99,
+                    "decision": "reject",
+                    "reason": "ignored because semantic filter disabled",
+                }
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "课时01": [
+                    {
+                        "entity_name": "课时01",
+                        "entity_type": "concept",
+                        "description": "课时标记",
+                        "source_id": "chunk-a",
+                        "file_path": "doc.pdf",
+                    }
+                ]
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="doc.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["concept"],
+            "hierarchy_enable_hard_candidate_filter": False,
+            "hierarchy_enable_semantic_candidate_filter": False,
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="课时01 课时01 课时01",
+    )
+
+    assert hierarchy is not None
+    assert len(prompts) == 1
+    assert '"reject"' not in prompts[0]
+    assert len(hierarchy.edges) == 1
+    assert hierarchy.edges[0][0] == "resource:doc-a"
+    assert hierarchy.edges[0][1] == "课时01"
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_counts_reject_as_round_progress():
+    prompts = []
+
+    async def fake_llm(prompt: str, **_kwargs):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return {
+                "assignments": [
+                    {
+                        "child": "课时01",
+                        "parent": None,
+                        "confidence": 0.99,
+                        "decision": "reject",
+                        "reason": "课时标记，不是知识点",
+                    }
+                ]
+            }
+        return {
+            "assignments": [
+                {
+                    "child": "二叉树",
+                    "parent": "树",
+                    "confidence": 0.9,
+                    "decision": "assign",
+                    "reason": "二叉树是一种树",
+                }
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "课时01": [
+                    {
+                        "entity_name": "课时01",
+                        "entity_type": "concept",
+                        "description": "课时标记",
+                        "source_id": "chunk-a",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+                "树": [
+                    {
+                        "entity_name": "树",
+                        "entity_type": "concept",
+                        "description": "树结构",
+                        "source_id": "chunk-b",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+                "二叉树": [
+                    {
+                        "entity_name": "二叉树",
+                        "entity_type": "concept",
+                        "description": "二叉树知识点",
+                        "source_id": "chunk-c",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="doc.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["concept"],
+            "hierarchy_enable_hard_candidate_filter": False,
+            "hierarchy_enable_semantic_candidate_filter": True,
+            "hierarchy_batch_size": 3,
+            "hierarchy_max_rounds": 2,
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="课时01 树 二叉树",
+    )
+
+    assert hierarchy is not None
+    edge_children = {target for _source, target, _data in hierarchy.edges}
+    assert edge_children == {"树", "二叉树"}
+    assert len(prompts) == 2
+
+    second_unresolved_json = prompts[1].split("Unresolved Children JSON:\n", 1)[
+        1
+    ].split("\nParent Candidates JSON:", 1)[0]
+    second_unresolved_names = {
+        item["name"] for item in json.loads(second_unresolved_json)
+    }
+    assert second_unresolved_names == {"树", "二叉树"}
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_does_not_retry_root_decisions():
+    prompts = []
+
+    async def fake_llm(prompt: str, **_kwargs):
+        prompts.append(prompt)
+        if len(prompts) > 1:
+            return {"assignments": []}
+        return {
+            "assignments": [
+                {
+                    "child": "Standalone",
+                    "parent": None,
+                    "confidence": 0.99,
+                    "decision": "root",
+                    "reason": "Valid root concept",
+                },
+                {
+                    "child": "Child",
+                    "parent": "Parent",
+                    "confidence": 0.9,
+                    "decision": "assign",
+                    "reason": "Child belongs to Parent",
+                },
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "Parent": [
+                    {
+                        "entity_name": "Parent",
+                        "entity_type": "concept",
+                        "description": "Parent concept",
+                        "source_id": "chunk-a",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+                "Child": [
+                    {
+                        "entity_name": "Child",
+                        "entity_type": "concept",
+                        "description": "Child concept",
+                        "source_id": "chunk-b",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+                "Standalone": [
+                    {
+                        "entity_name": "Standalone",
+                        "entity_type": "concept",
+                        "description": "Standalone concept",
+                        "source_id": "chunk-c",
+                        "file_path": "doc.pdf",
+                    }
+                ],
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="doc.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["concept"],
+            "hierarchy_enable_hard_candidate_filter": False,
+            "hierarchy_enable_semantic_candidate_filter": True,
+            "hierarchy_max_rounds": 2,
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="Parent Child Standalone",
+    )
+
+    assert hierarchy is not None
+    assert len(prompts) == 2
+
+    second_unresolved_json = prompts[1].split("Unresolved Children JSON:\n", 1)[
+        1
+    ].split("\nParent Candidates JSON:", 1)[0]
+    second_unresolved_names = {
+        item["name"] for item in json.loads(second_unresolved_json)
+    }
+    assert "Standalone" not in second_unresolved_names
 
 
 @pytest.mark.asyncio

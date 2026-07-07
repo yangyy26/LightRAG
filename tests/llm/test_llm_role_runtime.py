@@ -366,6 +366,37 @@ def test_role_llm_config_logs_once_on_init_with_metadata(
 
 
 @pytest.mark.asyncio
+async def test_role_llm_worker_startup_log_includes_model_name(
+    tmp_path, caplog, lightrag_logger_propagating
+):
+    rag = _make_rag(
+        tmp_path,
+        role_llm_configs={
+            "extract": RoleLLMConfig(
+                max_async=2,
+                timeout=42,
+                metadata={"model": "extract-model"},
+            )
+        },
+    )
+
+    caplog.clear()
+    with caplog.at_level("INFO", logger="lightrag"):
+        assert await rag.role_llm_funcs["extract"]("ping") == "base"
+
+    messages = _captured_messages(caplog)
+    startup_logs = [
+        message
+        for message in messages
+        if "extract LLM func" in message and "new workers initialized" in message
+    ]
+    assert startup_logs
+    assert "Model: extract-model" in startup_logs[0]
+
+    await rag.role_llm_funcs["extract"].shutdown(graceful=True)
+
+
+@pytest.mark.asyncio
 async def test_role_specific_kwargs_and_fallback(tmp_path):
     extract_calls = []
     vlm_calls = []

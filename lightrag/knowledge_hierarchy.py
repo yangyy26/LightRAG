@@ -7,6 +7,8 @@ import inspect
 
 import json
 import json_repair
+import re
+import unicodedata
 
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
@@ -46,6 +48,7 @@ class ParentAssignment:
     parent: str | None
     confidence: float
     reason: str = ""
+    decision: str = "assign"
 
 
 @dataclass
@@ -203,6 +206,56 @@ def filter_hierarchy_candidates_by_grounding(
     if removed:
         logger.info(
             "Filtered ungrounded hierarchy candidates: kept=%d, removed=%d",
+            len(filtered),
+            removed,
+        )
+    return filtered
+
+
+_PUNCT_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+_NUMBER_ONLY_RE = re.compile(r"^\d+(?:[.\-_/]\d+)*$")
+_ISO_DATE_RE = re.compile(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$")
+_CHINESE_DATE_RE = re.compile(r"^\d{2,4}年\d{1,2}月\d{1,2}日?$")
+_LESSON_MARKER_RE = re.compile(r"^(?:第?\d+\s*)?课时\s*\d*$|^课时\s*\d+$")
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+
+
+def _contains_cjk_char(text: str) -> bool:
+    return bool(_CJK_CHAR_RE.search(text))
+
+
+def _is_obvious_non_knowledge_candidate(name: str) -> bool:
+    text = unicodedata.normalize("NFKC", str(name or "")).strip()
+    compact = "".join(text.split())
+    if not compact:
+        return True
+    if len(compact) <= 1 and not _contains_cjk_char(compact):
+        return True
+    if _PUNCT_ONLY_RE.match(compact):
+        return True
+    if _NUMBER_ONLY_RE.match(compact):
+        return True
+    if _ISO_DATE_RE.match(compact):
+        return True
+    if _CHINESE_DATE_RE.match(compact):
+        return True
+    if _LESSON_MARKER_RE.match(compact):
+        return True
+    return False
+
+
+def filter_hierarchy_candidates_by_hard_rules(
+    candidates: dict[str, HierarchyCandidate],
+) -> dict[str, HierarchyCandidate]:
+    filtered = {
+        key: candidate
+        for key, candidate in candidates.items()
+        if not _is_obvious_non_knowledge_candidate(candidate.name)
+    }
+    removed = len(candidates) - len(filtered)
+    if removed:
+        logger.info(
+            "Filtered obvious non-knowledge hierarchy candidates: kept=%d, removed=%d",
             len(filtered),
             removed,
         )
@@ -697,10 +750,18 @@ def normalize_assignments_to_hierarchy(
         normalize_knowledge_point_name(candidate.name): key
         for key, candidate in candidates.items()
     }
+    rejected_keys = {
+        candidate_by_name[_assignment_key(assignment.child)]
+        for assignment in assignments
+        if assignment.decision == "reject"
+        and _assignment_key(assignment.child) in candidate_by_name
+    }
     parent_by_key: dict[str, str] = {}
 
     ranked = sorted(assignments, key=lambda item: item.confidence, reverse=True)
     for assignment in ranked:
+        if assignment.decision != "assign":
+            continue
         if assignment.confidence < min_confidence or not assignment.parent:
             continue
         child_key = candidate_by_name.get(_assignment_key(assignment.child))
@@ -718,7 +779,7 @@ def normalize_assignments_to_hierarchy(
             parent_by_key.pop(child_key, None)
 
     edges: list[tuple[str, str, dict[str, Any]]] = []
-    for key in sorted(candidates):
+    for key in sorted(key for key in candidates if key not in rejected_keys):
         candidate = candidates[key]
         parent_key = parent_by_key.get(key)
         if parent_key:
@@ -788,6 +849,7 @@ def _build_parent_assignment_prompt(
     parent_candidates: list[HierarchyCandidate],
     relations: list[dict[str, Any]],
     current_assignments: list[ParentAssignment],
+    enable_semantic_candidate_filter: bool = True,
 ) -> str:
     children_payload = [
         {
@@ -808,10 +870,34 @@ def _build_parent_assignment_prompt(
         for item in parent_candidates
     ]
     assigned_payload = [
-        {"child": item.child, "parent": item.parent, "confidence": item.confidence}
+        {
+            "child": item.child,
+            "parent": item.parent,
+            "confidence": item.confidence,
+            "decision": item.decision,
+        }
         for item in current_assignments
-        if item.parent
     ]
+    if enable_semantic_candidate_filter:
+        response_shape = (
+            '{"assignments": [{"child": string, "parent": string|null, '
+            '"confidence": number, "decision": "assign"|"root"|"reject", '
+            '"reason": string}]}.\n'
+            'Use decision="reject" only when the child is not a meaningful resource '
+            "knowledge point, such as lesson markers, dates, page numbers, serial "
+            "numbers, document-structure labels, administrative metadata, or vague "
+            "non-concept labels.\n"
+            'Use decision="root" when the child is a valid knowledge point but has '
+            "no clear parent.\n"
+        )
+    else:
+        response_shape = (
+            '{"assignments": [{"child": string, "parent": string|null, '
+            '"confidence": number, "decision": "assign"|"root", '
+            '"reason": string}]}.\n'
+            'Use decision="root" when the child is a valid knowledge point but has '
+            "no clear parent.\n"
+        )
     return (
         "Assign each unresolved child knowledge point to the best parent.\n"
         "Use the document context, entity descriptions, and extracted relations to "
@@ -819,8 +905,7 @@ def _build_parent_assignment_prompt(
         "Use only provided parent candidate names, or null when no parent is clear.\n"
         "Do not invent nodes. Do not assign a child to itself.\n"
         "Return JSON only with shape: "
-        '{"assignments": [{"child": string, "parent": string|null, '
-        '"confidence": number, "reason": string}]}.\n'
+        f"{response_shape}"
         f"Root title: {root_title}\n"
         f"Unresolved Children JSON:\n{json.dumps(children_payload, ensure_ascii=False)}\n"
         f"Parent Candidates JSON:\n{json.dumps(parents_payload, ensure_ascii=False)}\n"
@@ -930,12 +1015,16 @@ def parse_parent_assignments(raw: Any) -> list[ParentAssignment]:
         except (TypeError, ValueError):
             confidence = 0.0
         reason = str(row.get("reason") or "").strip()
+        decision = str(row.get("decision") or "").strip().lower()
+        if decision not in {"assign", "root", "reject"}:
+            decision = "assign" if parent else "root"
         assignments.append(
             ParentAssignment(
                 child=child,
                 parent=parent,
                 confidence=max(0.0, min(confidence, 1.0)),
                 reason=reason,
+                decision=decision,
             )
         )
     return assignments
@@ -979,6 +1068,8 @@ async def build_resource_knowledge_hierarchy(
         candidates,
         grounding_text,
     )
+    if bool(global_config.get("hierarchy_enable_hard_candidate_filter", True)):
+        candidates = filter_hierarchy_candidates_by_hard_rules(candidates)
     if not candidates:
         logger.info(
             "No hierarchy candidates found for `%s` (candidate_entity_types=%s)",
@@ -1019,6 +1110,9 @@ async def build_resource_knowledge_hierarchy(
     )
     min_confidence = float(global_config.get("hierarchy_min_parent_confidence", 0.6))
     max_parallel_batches = int(global_config.get("hierarchy_max_parallel_batches", 3))
+    enable_semantic_candidate_filter = bool(
+        global_config.get("hierarchy_enable_semantic_candidate_filter", True)
+    )
 
     assignments = assign_parents_from_relations(all_candidates, relations)
     assigned_children = {
@@ -1026,13 +1120,27 @@ async def build_resource_knowledge_hierarchy(
         for item in assignments
         if item.parent and item.confidence >= min_confidence
     }
+    rejected_children = {
+        normalize_knowledge_point_name(item.child)
+        for item in assignments
+        if item.decision == "reject"
+    }
+    rooted_children = {
+        normalize_knowledge_point_name(item.child)
+        for item in assignments
+        if item.decision == "root"
+    }
 
     for _round in range(max(0, max_rounds)):
-        assigned_count_before_round = len(assigned_children)
+        progress_count_before_round = (
+            len(assigned_children) + len(rooted_children) + len(rejected_children)
+        )
         unresolved = [
             candidate
             for key, candidate in all_candidates.items()
             if key not in assigned_children
+            and key not in rooted_children
+            and key not in rejected_children
         ]
         if not unresolved:
             break
@@ -1055,6 +1163,7 @@ async def build_resource_knowledge_hierarchy(
                 parent_candidates=parent_candidates,
                 relations=relations,
                 current_assignments=round_assignments,
+                enable_semantic_candidate_filter=enable_semantic_candidate_filter,
             )
             try:
                 async with batch_semaphore:
@@ -1071,7 +1180,12 @@ async def build_resource_knowledge_hierarchy(
                         )
                     else:
                         raw = await llm_func(prompt)
-                    return parse_parent_assignments(raw)
+                    parsed = parse_parent_assignments(raw)
+                    if not enable_semantic_candidate_filter:
+                        for item in parsed:
+                            if item.decision == "reject":
+                                item.decision = "root"
+                    return parsed
             except Exception as exc:
                 logger.warning(
                     "Hierarchy parent assignment batch failed for `%s`: %s",
@@ -1087,10 +1201,19 @@ async def build_resource_knowledge_hierarchy(
         for parsed_assignments in batch_results:
             assignments.extend(parsed_assignments)
             for item in parsed_assignments:
+                if item.decision == "reject":
+                    rejected_children.add(normalize_knowledge_point_name(item.child))
+                    continue
+                if item.decision == "root":
+                    rooted_children.add(normalize_knowledge_point_name(item.child))
+                    continue
                 if item.parent and item.confidence >= min_confidence:
                     assigned_children.add(normalize_knowledge_point_name(item.child))
 
-        if len(assigned_children) == assigned_count_before_round:
+        progress_count_after_round = (
+            len(assigned_children) + len(rooted_children) + len(rejected_children)
+        )
+        if progress_count_after_round == progress_count_before_round:
             break
 
     return normalize_assignments_to_hierarchy(
@@ -1159,13 +1282,6 @@ async def persist_resource_knowledge_hierarchy(
         if (src == root_id or src in existing_endpoints)
         and (tgt == root_id or tgt in existing_endpoints)
     ]
-    if not valid_edges:
-        logger.warning(
-            "Knowledge hierarchy skipped: root_id=%s has no valid hierarchy edges",
-            root_id,
-        )
-        return False
-
     existing_edges = await knowledge_graph_inst.get_all_edges()
     stale_edges = []
     for edge in existing_edges:
@@ -1177,6 +1293,13 @@ async def persist_resource_knowledge_hierarchy(
             stale_edges.append((str(source), str(target)))
     if stale_edges:
         await knowledge_graph_inst.remove_edges(stale_edges)
+
+    if not valid_edges:
+        logger.warning(
+            "Knowledge hierarchy skipped: root_id=%s has no valid hierarchy edges",
+            root_id,
+        )
+        return False
 
     nodes = [(hierarchy.root.entity_id, hierarchy.root.to_graph_data())]
     await knowledge_graph_inst.upsert_nodes_batch(nodes)
