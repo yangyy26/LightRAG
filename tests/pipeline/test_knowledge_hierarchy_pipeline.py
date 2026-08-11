@@ -304,10 +304,10 @@ async def test_maybe_build_knowledge_hierarchy_flushes_after_persist(monkeypatch
             self.flush_count += 1
 
     harness = Harness()
-    harness.chunk_entity_relation_graph.has_nodes_batch.return_value = {
-        "Photosynthesis",
-        "Chlorophyll",
-        "Light Reaction",
+    harness.chunk_entity_relation_graph.get_nodes_batch.return_value = {
+        "Photosynthesis": {},
+        "Chlorophyll": {},
+        "Light Reaction": {},
     }
     harness.chunk_entity_relation_graph.get_all_edges.return_value = []
     await harness._maybe_build_knowledge_hierarchy(

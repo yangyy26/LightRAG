@@ -43,6 +43,7 @@ from lightrag.constants import (
     PROCESS_OPTION_CHUNK_PARAGRAH,
     PROCESS_OPTION_CHUNK_RECURSIVE,
     PROCESS_OPTION_CHUNK_VECTOR,
+    PROCESS_OPTION_SKIP_HIERARCHY,
 )
 from lightrag.parser.routing import (
     FilenameParserHintError,
@@ -430,6 +431,10 @@ class InsertTextRequest(BaseModel):
         default=None,
         description="Chunking strategy and params; omit for default fixed-token chunking",
     )
+    skip_hierarchy: bool = Field(
+        default=False,
+        description="Skip community/leiden hierarchy build (keep KG only)",
+    )
 
     @field_validator("text", mode="after")
     @classmethod
@@ -478,6 +483,10 @@ class InsertTextsRequest(BaseModel):
     chunking: Optional[TextChunkingConfig] = Field(
         default=None,
         description="Shared chunking strategy and params for all texts; omit for default fixed-token chunking",
+    )
+    skip_hierarchy: bool = Field(
+        default=False,
+        description="Skip community/leiden hierarchy build (keep KG only)",
     )
 
     @field_validator("texts", mode="after")
@@ -1995,6 +2004,7 @@ async def pipeline_enqueue_file(
     file_path: Path,
     track_id: str = None,
     from_scan: bool = False,
+    skip_hierarchy: bool = False,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2006,6 +2016,7 @@ async def pipeline_enqueue_file(
             which already holds ``pipeline_status["scanning"]``.  Forwarded to
             ``apipeline_enqueue_documents`` so the scan can enqueue the files
             it just discovered without tripping the scanning guard there.
+        skip_hierarchy: When True, skip community/leiden hierarchy build (KG only)
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2061,6 +2072,8 @@ async def pipeline_enqueue_file(
             return False, track_id
 
         api_process_options = process_options or PROCESS_OPTION_CHUNK_FIXED
+        if skip_hierarchy:
+            api_process_options += PROCESS_OPTION_SKIP_HIERARCHY
         if ext in _LEGACY_OFFICE_EXTENSIONS:
             conv_info = _LEGACY_OFFICE_CONVERSION_MAP[ext]
             _, _, out_suffix = conv_info
@@ -2883,16 +2896,24 @@ async def _upsert_doc_status_and_flush(
     await rag.doc_status.index_done_callback()
 
 
-async def pipeline_index_file(rag: "LightRAG", file_path: Path, track_id: str = None):
+async def pipeline_index_file(
+    rag: "LightRAG",
+    file_path: Path,
+    track_id: str = None,
+    skip_hierarchy: bool = False,
+):
     """Index a file with track_id
 
     Args:
         rag: LightRAG instance
         file_path: Path to the saved file
         track_id: Optional tracking ID
+        skip_hierarchy: When True, skip community/leiden hierarchy build (KG only)
     """
     try:
-        success, _ = await pipeline_enqueue_file(rag, file_path, track_id)
+        success, _ = await pipeline_enqueue_file(
+            rag, file_path, track_id, skip_hierarchy=skip_hierarchy
+        )
         if success:
             await rag.apipeline_process_enqueue_documents()
 
@@ -2957,7 +2978,9 @@ _STRATEGY_TO_PROCESS_OPTION: Dict[str, str] = {
 
 
 def _resolve_text_chunking(
-    chunking: Optional[TextChunkingConfig], rag: "LightRAG"
+    chunking: Optional[TextChunkingConfig],
+    rag: "LightRAG",
+    skip_hierarchy: bool = False,
 ) -> tuple[str, dict]:
     """Freeze a ``chunking`` request into ``(process_options, chunk_options)``.
 
@@ -2986,11 +3009,15 @@ def _resolve_text_chunking(
         # No request-driven config: reproduce today's behavior verbatim,
         # including not introducing new validation on the default path.
         process_options = PROCESS_OPTION_CHUNK_FIXED
+        if skip_hierarchy:
+            process_options += PROCESS_OPTION_SKIP_HIERARCHY
         return process_options, resolve_chunk_options(
             rag.addon_params, process_options=process_options
         )
 
     process_options = _STRATEGY_TO_PROCESS_OPTION[chunking.strategy]
+    if skip_hierarchy:
+        process_options += PROCESS_OPTION_SKIP_HIERARCHY
     chunk_options = resolve_chunk_options(
         rag.addon_params, process_options=process_options
     )
@@ -3079,6 +3106,7 @@ async def pipeline_index_texts(
     file_sources: List[str] = None,
     track_id: str = None,
     chunking: Optional[TextChunkingConfig] = None,
+    skip_hierarchy: bool = False,
 ):
     """Index a list of texts with track_id
 
@@ -3089,6 +3117,7 @@ async def pipeline_index_texts(
         track_id: Optional tracking ID
         chunking: Optional chunking strategy + params (already validated by
             the request model); when None, default fixed-token chunking is used
+        skip_hierarchy: When True, skip community/leiden hierarchy build (KG only)
     """
     if not texts:
         return
@@ -3102,7 +3131,9 @@ async def pipeline_index_texts(
     if len(set(normalized_file_sources)) != len(normalized_file_sources):
         raise ValueError("File sources must be unique by filename")
 
-    process_options, chunk_options = _resolve_text_chunking(chunking, rag)
+    process_options, chunk_options = _resolve_text_chunking(
+        chunking, rag, skip_hierarchy=skip_hierarchy
+    )
     await rag.apipeline_enqueue_documents(
         input=texts,
         file_paths=normalized_file_sources,
@@ -3758,6 +3789,9 @@ def create_document_routes(
         file: UploadFile = File(...),
         context: WorkspaceContext = Depends(workspace_dependency),
         callback_url: str | None = Query(None, description="HTTP(S) URL called after hierarchy generation completes"),
+        skip_hierarchy: bool = Query(
+            False, description="Skip community/leiden hierarchy build (keep KG only)"
+        ),
     ):
         """
         Upload a file to the input directory and index it.
@@ -3990,7 +4024,9 @@ def create_document_routes(
                             mime_type=file.content_type,
                         )
                     else:
-                        await pipeline_index_file(rag, file_path, track_id)
+                        await pipeline_index_file(
+                            rag, file_path, track_id, skip_hierarchy=skip_hierarchy
+                        )
 
                     if callback_url is not None:
                         try:
@@ -4129,6 +4165,7 @@ def create_document_routes(
                         file_sources=[normalized_file_source],
                         track_id=track_id,
                         chunking=request.chunking,
+                        skip_hierarchy=request.skip_hierarchy,
                     )
                 finally:
                     await _release_enqueue_slot(rag)
@@ -4256,6 +4293,7 @@ def create_document_routes(
                         file_sources=normalized_file_sources,
                         track_id=track_id,
                         chunking=request.chunking,
+                        skip_hierarchy=request.skip_hierarchy,
                     )
                 finally:
                     await _release_enqueue_slot(rag)

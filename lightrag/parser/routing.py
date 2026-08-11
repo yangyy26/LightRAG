@@ -27,6 +27,7 @@ from lightrag.constants import (
     PROCESS_OPTION_EQUATIONS,
     PROCESS_OPTION_IMAGES,
     PROCESS_OPTION_SKIP_KG,
+    PROCESS_OPTION_SKIP_HIERARCHY,
     PROCESS_OPTION_TABLES,
     ProcessChunkingOption,
     SUPPORTED_PARSER_ENGINES,
@@ -83,6 +84,7 @@ class ProcessOptions:
     tables: bool = False
     equations: bool = False
     skip_kg: bool = False
+    skip_hierarchy: bool = False
     chunking: ProcessChunkingOption = PROCESS_OPTION_CHUNK_FIXED
 
     @property
@@ -159,6 +161,7 @@ def parse_process_options(options: Any) -> ProcessOptions:
         tables=PROCESS_OPTION_TABLES in chars,
         equations=PROCESS_OPTION_EQUATIONS in chars,
         skip_kg=PROCESS_OPTION_SKIP_KG in chars,
+        skip_hierarchy=PROCESS_OPTION_SKIP_HIERARCHY in chars,
         chunking=chunking,
     )
 

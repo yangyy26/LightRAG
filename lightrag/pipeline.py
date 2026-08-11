@@ -2924,7 +2924,7 @@ class _PipelineMixin:
 
                     await self._insert_done()
 
-                    if not doc_process_opts.skip_kg:
+                    if not doc_process_opts.skip_kg and not doc_process_opts.skip_hierarchy:
                         await self._schedule_knowledge_hierarchy_build(
                             doc_id=doc_id,
                             file_path=file_path,

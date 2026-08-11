@@ -57,7 +57,7 @@ async def test_persist_resource_knowledge_hierarchy_writes_graph_and_entity_vdb(
         ],
     )
     graph = AsyncMock()
-    graph.has_nodes_batch.return_value = {"Binary Tree"}
+    graph.get_nodes_batch.return_value = {"Binary Tree": {}}
     graph.get_all_edges.return_value = [
         {
             "source": "resource:doc-a",
@@ -90,7 +90,7 @@ async def test_persist_resource_knowledge_hierarchy_writes_graph_and_entity_vdb(
 
 
 @pytest.mark.asyncio
-async def test_persist_resource_knowledge_hierarchy_skips_edges_with_missing_endpoints():
+async def test_persist_resource_knowledge_hierarchy_materializes_missing_endpoints():
     root = HierarchyNode(
         entity_id="resource:doc-a",
         entity_name="trees.pdf",
@@ -115,18 +115,30 @@ async def test_persist_resource_knowledge_hierarchy_skips_edges_with_missing_end
                     "root_id": "resource:doc-a",
                     "parent_id": "resource:doc-a",
                     "child_id": "Missing Entity",
+                    "source_id": "chunk-a",
+                    "file_path": "trees.pdf",
                 },
             )
         ],
     )
     graph = AsyncMock()
-    graph.has_nodes_batch.return_value = set()
+    graph.get_nodes_batch.return_value = {}
+    graph.get_node.return_value = None
     entity_vdb = AsyncMock()
 
-    await persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb)
+    persisted = await persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb)
 
-    graph.upsert_nodes_batch.assert_not_awaited()
-    graph.upsert_edges_batch.assert_not_awaited()
+    assert persisted is True
+    # The missing endpoint is materialized as a knowledge-point node so the
+    # hierarchy edge is not left dangling.
+    graph.upsert_nodes_batch.assert_awaited_once()
+    materialized = graph.upsert_nodes_batch.await_args.args[0]
+    assert materialized[0][0] == "Missing Entity"
+    assert materialized[0][1]["entity_type"] == "knowledgepoint"
+    graph.upsert_edges_batch.assert_awaited_once()
+    edges = graph.upsert_edges_batch.await_args.args[0]
+    assert edges[0][0] == "resource:doc-a"
+    assert edges[0][1] == "Missing Entity"
 
 
 @pytest.mark.asyncio

@@ -245,6 +245,7 @@ PROCESS_OPTION_IMAGES = "i"  # Enable VLM analysis for drawings/images
 PROCESS_OPTION_TABLES = "t"  # Enable VLM analysis for tables
 PROCESS_OPTION_EQUATIONS = "e"  # Enable VLM analysis for equations
 PROCESS_OPTION_SKIP_KG = "!"  # Skip entity/relation extraction (no KG build)
+PROCESS_OPTION_SKIP_HIERARCHY = "h"  # Skip community/leiden hierarchy build (keep KG)
 ProcessChunkingOption: TypeAlias = Literal["F", "R", "V", "P"]
 PROCESS_OPTION_CHUNK_FIXED: ProcessChunkingOption = (
     "F"  # Fixed-length / separator chunking (default)
@@ -273,6 +274,7 @@ SUPPORTED_PROCESS_OPTIONS = frozenset(
         PROCESS_OPTION_TABLES,
         PROCESS_OPTION_EQUATIONS,
         PROCESS_OPTION_SKIP_KG,
+        PROCESS_OPTION_SKIP_HIERARCHY,
         PROCESS_OPTION_CHUNK_FIXED,
         PROCESS_OPTION_CHUNK_RECURSIVE,
         PROCESS_OPTION_CHUNK_VECTOR,

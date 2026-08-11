@@ -181,13 +181,10 @@ class _RoleLLMMixin:
         model_kwargs: dict[str, Any],
     ) -> Callable[..., object]:
         spec = ROLES_BY_NAME[role_name]
-        metadata = self._role_llm_states[role_name].metadata
-        model_name = metadata.get("model") or self.llm_model_name
         return priority_limit_async_func_call(
             max_async,
             llm_timeout=timeout,
             queue_name=spec.queue_name,
-            startup_log_context=f"Model: {model_name}" if model_name else None,
         )(
             partial(
                 raw_func,

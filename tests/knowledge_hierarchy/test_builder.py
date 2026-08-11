@@ -327,6 +327,43 @@ def test_normalize_assignments_removes_semantically_rejected_candidates():
     assert edge_children == {"二叉树"}
 
 
+def test_normalize_assignments_keeps_all_candidates_when_filter_rejects_everything():
+    # An over-aggressive semantic filter must not drop the entire hierarchy:
+    # if every candidate is rejected we fall back to rooting them so the
+    # resource still gets a (flat) hierarchy instead of failing with
+    # "no valid hierarchy edges matched existing graph nodes".
+    candidates = _candidate_map("邻补角", "补角")
+    hierarchy = normalize_assignments_to_hierarchy(
+        root_id="resource:doc-a",
+        root_title="什么是邻居补角.mp4",
+        file_path="什么是邻居补角.mp4",
+        candidates=candidates,
+        assignments=[
+            ParentAssignment(
+                child="邻补角",
+                parent=None,
+                confidence=0.99,
+                decision="reject",
+                reason="误判",
+            ),
+            ParentAssignment(
+                child="补角",
+                parent=None,
+                confidence=0.99,
+                decision="reject",
+                reason="误判",
+            ),
+        ],
+        max_depth=5,
+        min_confidence=0.6,
+    )
+
+    edge_children = {target for _source, target, _data in hierarchy.edges}
+    assert edge_children == {"邻补角", "补角"}
+    # All fall back to root-level attachment.
+    assert all(source == "resource:doc-a" for source, _target, _data in hierarchy.edges)
+
+
 def test_normalize_assignments_keeps_missing_decision_as_root_candidate():
     candidates = _candidate_map("二叉树")
     hierarchy = normalize_assignments_to_hierarchy(
@@ -938,6 +975,60 @@ async def test_build_resource_knowledge_hierarchy_calls_llm_and_normalizes_json(
     assert ("Tree", "Binary Tree") in [
         (src, tgt) for src, tgt, _data in hierarchy.edges
     ]
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_falls_back_when_grounding_strips_all():
+    # Regression: media transcripts often have extracted entity names that do
+    # not appear verbatim in the grounding text. The grounding filter must not
+    # drop every candidate and cause "No hierarchy was generated".
+    async def fake_llm(prompt: str, **kwargs):
+        return {
+            "assignments": [
+                {
+                    "child": "作物育种",
+                    "parent": None,
+                    "confidence": 0.9,
+                    "reason": "root-level knowledge point",
+                }
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "作物育种": [
+                    {
+                        "entity_name": "作物育种",
+                        "entity_type": "knowledgepoint",
+                        "description": "crop breeding",
+                        "source_id": "chunk-a",
+                        "file_path": "制订作物育种目标的原则2.mp4",
+                    }
+                ]
+            },
+            {},
+        )
+    ]
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-breeding",
+        file_path="制订作物育种目标的原则2.mp4",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": ["knowledgepoint", "concept"],
+            "hierarchy_max_depth": 5,
+            "llm_model_func": fake_llm,
+        },
+        # Grounding text that does NOT contain the candidate name -> the
+        # grounding filter would remove everything without the fallback.
+        grounding_text="这是一段与知识点名称不完全匹配的转写文本。",
+    )
+
+    assert hierarchy is not None
+    edge_children = {tgt for _src, tgt, _data in hierarchy.edges}
+    assert edge_children == {"作物育种"}
 
 
 @pytest.mark.asyncio

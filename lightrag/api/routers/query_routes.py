@@ -6,6 +6,7 @@ import json
 from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from lightrag.base import QueryParam
+from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.api.workspace import WorkspaceContext
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
@@ -199,6 +200,17 @@ class QueryDataResponse(BaseModel):
     )
     metadata: Dict[str, Any] = Field(
         description="Query metadata including mode, keywords, and processing information"
+    )
+
+
+class QueryFilesResponse(BaseModel):
+    status: str = Field(description="Query execution status")
+    message: str = Field(description="Status message")
+    data: Dict[str, Any] = Field(
+        description="Relevant file list with per-file hit counts, sorted by relevance (hit count) descending"
+    )
+    metadata: Dict[str, Any] = Field(
+        description="Query metadata including mode and file statistics"
     )
 
 
@@ -1224,6 +1236,164 @@ def create_query_routes(
                 )
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/query/files",
+        response_model=QueryFilesResponse,
+        dependencies=[Depends(combined_auth)],
+        responses={
+            200: {
+                "description": "Successful relevant file retrieval response",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["success", "failure"],
+                                },
+                                "message": {"type": "string"},
+                                "data": {
+                                    "type": "object",
+                                    "properties": {
+                                        "files": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "file_path": {"type": "string"},
+                                                    "reference_id": {"type": "string"},
+                                                    "hit_count": {"type": "integer"},
+                                                    "entity_names": {
+                                                        "type": "array",
+                                                        "items": {"type": "string"},
+                                                        "description": "Set of entity names retrieved from this file",
+                                                    },
+                                                },
+                                            },
+                                            "description": "Relevant files sorted by hit count (relevance) descending",
+                                        }
+                                    },
+                                },
+                                "metadata": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query_mode": {"type": "string"},
+                                        "total_files": {"type": "integer"},
+                                    },
+                                },
+                            },
+                            "required": ["status", "message", "data", "metadata"],
+                        }
+                    }
+                },
+            }
+        },
+    )
+    async def query_files(
+        request: QueryRequest,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        """
+        Retrieve a list of relevant source files for a query, ranked by relevance.
+
+        This endpoint reuses the same retrieval pipeline as /query/data but returns a
+        condensed, file-centric view: it aggregates how many retrieved entities,
+        relationships, and text chunks originate from each source file, then ranks the
+        files by that hit count (a lightweight relevance proxy) in descending order.
+
+        Useful for:
+        - **Source discovery**: "Which documents are most relevant to this prompt?"
+        - **Citation surfacing**: Quickly locate the files behind a RAG answer.
+        - **Filtering / routing**: Pick the top-N files before deeper processing.
+
+        **Relevance scoring**:
+        - `hit_count` = number of retrieved entities + relationships whose
+          `file_path` matches the file. Higher means the file contributed more retrieved
+          context to the query. This is a proxy, not a vector similarity score.
+          Note: `file_path` values coming only from retrieved text `chunks` are excluded
+          from the returned file list.
+        - `entity_names` = the set of entity names that originate from this file. It is
+          built from the `entities` list (`entity_name`) plus the source endpoint of each
+          `relationships` entry (`src_id`), i.e. the knowledge-graph entities hit within it.
+
+        Args:
+            request (QueryRequest): Same query parameters as /query/data (query, mode,
+                top_k, chunk_top_k, hl_keywords, ll_keywords, enable_rerank, etc.).
+
+        Returns:
+            QueryFilesResponse: Structured JSON with `data.files` (sorted by hit_count
+                descending) and `metadata` (query_mode, total_files).
+
+        Raises:
+            HTTPException: 500 on internal processing errors.
+        """
+        try:
+            rag = context.rag
+            param = request.to_query_params(False)  # No streaming for files endpoint
+            response = await rag.aquery_data(request.query, param=param)
+
+            if not isinstance(response, dict):
+                return QueryFilesResponse(
+                    status="failure",
+                    message="Invalid response type",
+                    data={"files": []},
+                    metadata={},
+                )
+
+            data = response.get("data", {}) or {}
+
+            # Aggregate hits per file across entities and relationships only.
+            # Chunks are deliberately excluded so that file paths contributed solely
+            # by retrieved text chunks do not appear in the returned file list
+            # (`file_path` from chunks is dropped). `file_path` may still join
+            # multiple document links with GRAPH_FIELD_SEP (e.g. "a.docx<SEP>b.docx");
+            # split them and count each as a distinct source file so both
+            # documents get their own entry.
+            files_map: Dict[str, Dict[str, Any]] = {}
+            for item in data.get("entities", []) + data.get("relationships", []):
+                raw_path = item.get("file_path") or "unknown_source"
+                file_paths = [p for p in raw_path.split(GRAPH_FIELD_SEP) if p]
+                if not file_paths:
+                    file_paths = ["unknown_source"]
+                reference_id = item.get("reference_id") or ""
+                # Collect the set of entity names originating from this file.
+                # Entities contribute `entity_name`; relationships contribute their
+                # source endpoint `src_id` (also an entity name).
+                entity_name = item.get("entity_name") or item.get("src_id")
+                for file_path in file_paths:
+                    entry = files_map.get(file_path)
+                    if entry is None:
+                        entry = {
+                            "file_path": file_path,
+                            "reference_id": reference_id,
+                            "hit_count": 0,
+                            "entity_names": [],
+                        }
+                        files_map[file_path] = entry
+                    entry["hit_count"] += 1
+                    if not entry["reference_id"] and reference_id:
+                        entry["reference_id"] = reference_id
+                    if entity_name and entity_name not in entry["entity_names"]:
+                        entry["entity_names"].append(entity_name)
+
+            files = list(files_map.values())
+            files.sort(key=lambda f: f["hit_count"], reverse=True)
+
+            resp_metadata = response.get("metadata", {}) or {}
+            return QueryFilesResponse(
+                status=response.get("status", "success"),
+                message=response.get("message", "Query executed successfully"),
+                data={"files": files},
+                metadata={
+                    "query_mode": resp_metadata.get("query_mode", param.mode),
+                    "total_files": len(files),
+                },
+            )
+        except Exception as e:
+            logger.error(f"Error processing files query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
     return router

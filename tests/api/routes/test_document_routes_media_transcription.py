@@ -237,6 +237,53 @@ def test_media_resource_config_reads_paths_and_download_origin(monkeypatch):
     assert config.download_origin == "http://public-object:19000"
 
 
+def test_media_resource_config_defaults_to_multipart_upload_mode(monkeypatch):
+    from lightrag.api.media_transcription import load_media_resource_config
+
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.delenv("MEDIA_RESOURCE_UPLOAD_MODE", raising=False)
+
+    config = load_media_resource_config()
+
+    assert config.upload_mode == "multipart"
+    assert config.oss_upload_info_path == "/gatewayApi/resource/upload/getResUploadInfo"
+    assert config.oss_callback_path == "/gatewayApi/resource/upload/dfsCallback"
+
+
+def test_media_resource_config_reads_oss_upload_mode_and_paths(monkeypatch):
+    from lightrag.api.media_transcription import load_media_resource_config
+
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setenv("MEDIA_RESOURCE_UPLOAD_MODE", "OSS")
+    monkeypatch.setenv("MEDIA_RESOURCE_OSS_UPLOAD_INFO_PATH", "custom/getInfo")
+    monkeypatch.setenv("MEDIA_RESOURCE_OSS_CALLBACK_PATH", "/custom/callback")
+
+    config = load_media_resource_config()
+
+    assert config.upload_mode == "oss"
+    assert config.oss_upload_info_path == "/custom/getInfo"
+    assert config.oss_callback_path == "/custom/callback"
+
+
+def test_media_resource_config_rejects_invalid_upload_mode(monkeypatch):
+    from lightrag.api.media_transcription import (
+        TranscriptionConfigError,
+        load_media_resource_config,
+    )
+
+    monkeypatch.setenv("MEDIA_RESOURCE_BASE_URL", "http://media.local")
+    monkeypatch.setenv("MEDIA_RESOURCE_UPLOAD_MODE", "ftp")
+
+    with pytest.raises(TranscriptionConfigError):
+        load_media_resource_config()
+
+
+def test_upload_media_to_resource_service_runs_oss_flow(monkeypatch, tmp_path):
+    asyncio.run(
+        _assert_upload_media_to_resource_service_runs_oss_flow(monkeypatch, tmp_path)
+    )
+
+
 def test_upload_media_to_resource_service_runs_multipart_flow(monkeypatch, tmp_path):
     asyncio.run(_assert_upload_media_to_resource_service_runs_multipart_flow(monkeypatch, tmp_path))
 
@@ -505,6 +552,224 @@ async def _assert_upload_media_to_resource_service_reuploads_fast_check_url_with
 
     assert result == "http://objects/whisper/voice.mp3"
     assert requested_paths == ["/check", "/init", "/chunk-1", "/merge"]
+
+
+async def _assert_upload_media_to_resource_service_runs_oss_flow(monkeypatch, tmp_path):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        upload_media_to_resource_service,
+    )
+
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"abcdef")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/gatewayApi/resource/upload/getResUploadInfo":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "msg": "操作成功",
+                    "result": {
+                        "host": "https://gj-doc.oss-cn-hangzhou.aliyuncs.com",
+                        "signature": {
+                            "ossAccessKeyId": "ak-1",
+                            "signature": "sig-1",
+                            "callbackUrl": "https://public.example.com/gatewayApi/resource/upload/dfsCallback?bucket=gj-doc&strategy=oss",
+                            "strategy": "2",
+                            "key": "doc_mk/2026/07/21/tp@ABC.mp4",
+                            "policy": "policy-1",
+                        },
+                    },
+                },
+            )
+        if request.url.host == "gj-doc.oss-cn-hangzhou.aliyuncs.com":
+            return httpx.Response(200, headers={"ETag": '"ETAG-1"'})
+        if request.url.path == "/gatewayApi/resource/upload/dfsCallback":
+            return httpx.Response(
+                200,
+                json={
+                    "msg": "Success",
+                    "bucket": "gj-doc",
+                    "code": 1,
+                    "size": 6,
+                    "strategy": "oss",
+                    "url": "doc_mk/2026/07/21/tp@ABC.mp4",
+                    "key": "doc_mk/2026/07/21/tp@ABC.mp4",
+                    "md5": "ABC",
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    result = await upload_media_to_resource_service(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="token-1",
+            domain="media-domain",
+            chunk_size=1024,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/preview",
+            download_origin="",
+            upload_mode="oss",
+            oss_upload_info_path="/gatewayApi/resource/upload/getResUploadInfo",
+            oss_callback_path="/gatewayApi/resource/upload/dfsCallback",
+        ),
+        source,
+        filename="lecture.mp4",
+        content_type="video/mp4",
+    )
+
+    assert result == "doc_mk/2026/07/21/tp@ABC.mp4"
+    assert [request.method for request in requests] == ["POST", "POST", "POST"]
+
+    # Interface 1: form-urlencoded getResUploadInfo
+    info_request = requests[0]
+    assert info_request.headers["token"] == "token-1"
+    assert info_request.headers["domain"] == "media-domain"
+    assert (
+        info_request.headers["content-type"] == "application/x-www-form-urlencoded"
+    )
+    info_fields = dict(_parse_urlencoded(info_request.content.decode("utf-8")))
+    assert info_fields["fileName"] == "lecture.mp4"
+    assert info_fields["size"] == "6"
+
+    # Interface 2: multipart POST to the OSS host
+    oss_request = requests[1]
+    assert oss_request.url.host == "gj-doc.oss-cn-hangzhou.aliyuncs.com"
+    assert oss_request.headers["content-type"].startswith("multipart/form-data")
+    body = oss_request.content.decode("utf-8", errors="ignore")
+    assert 'name="OSSAccessKeyId"' in body
+    assert "ak-1" in body
+    assert "sig-1" in body
+    assert "doc_mk/2026/07/21/tp@ABC.mp4" in body
+    assert 'name="success_action_status"' in body
+
+    # Interface 3: dfsCallback, origin rewritten to base_url with etag/key merged
+    callback_request = requests[2]
+    assert callback_request.url.host == "media.local"
+    assert callback_request.url.path == "/gatewayApi/resource/upload/dfsCallback"
+    callback_params = dict(callback_request.url.params)
+    assert callback_params["bucket"] == "gj-doc"
+    assert callback_params["strategy"] == "oss"
+    assert callback_params["etag"] == '"ETAG-1"'
+    assert callback_params["key"] == "doc_mk/2026/07/21/tp@ABC.mp4"
+
+
+def test_upload_media_to_resource_service_runs_oss_flow_existing_file(monkeypatch, tmp_path):
+    asyncio.run(
+        _assert_upload_media_to_resource_service_runs_oss_flow_existing_file(
+            monkeypatch, tmp_path
+        )
+    )
+
+
+async def _assert_upload_media_to_resource_service_runs_oss_flow_existing_file(
+    monkeypatch, tmp_path
+):
+    import httpx
+
+    from lightrag.api.media_transcription import (
+        MediaResourceConfig,
+        upload_media_to_resource_service,
+    )
+
+    source = tmp_path / "lecture.mp4"
+    source.write_bytes(b"abcdef")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        # The file already exists (matched by md5): the endpoint returns the
+        # existing resource metadata without a presigned host/signature.
+        if request.url.path == "/gatewayApi/resource/upload/getResUploadInfo":
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "msg": "操作成功",
+                    "result": {
+                        "bucket": None,
+                        "strategy": None,
+                        "md5": "ABC",
+                        "fileName": "lecture.mp4",
+                        "size": 6,
+                        "duration": 70.0,
+                        "url": "doc_mk/2025/04/11/2969A158/tp@ABC.mp4",
+                        "category": "video",
+                        "transferState": 2,
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            self._client = original_async_client(transport=transport)
+
+        async def __aenter__(self):
+            return self._client
+
+        async def __aexit__(self, *args):
+            await self._client.aclose()
+
+    monkeypatch.setattr("httpx.AsyncClient", Client)
+
+    result = await upload_media_to_resource_service(
+        MediaResourceConfig(
+            base_url="http://media.local",
+            token="token-1",
+            domain="media-domain",
+            chunk_size=1024,
+            timeout=10,
+            multipart_check_path="/check",
+            multipart_init_path="/init",
+            multipart_merge_path="/merge",
+            preview_path="/preview",
+            download_origin="",
+            upload_mode="oss",
+            oss_upload_info_path="/gatewayApi/resource/upload/getResUploadInfo",
+            oss_callback_path="/gatewayApi/resource/upload/dfsCallback",
+        ),
+        source,
+        filename="lecture.mp4",
+        content_type="video/mp4",
+    )
+
+    # Reuses the existing object key, no OSS POST / dfsCallback performed.
+    assert result == "doc_mk/2025/04/11/2969A158/tp@ABC.mp4"
+    assert [request.method for request in requests] == ["POST"]
+    assert requests[0].url.path == "/gatewayApi/resource/upload/getResUploadInfo"
+
+
+def _parse_urlencoded(raw: str):
+    from urllib.parse import parse_qsl
+
+    return parse_qsl(raw, keep_blank_values=True)
 
 
 def test_rewrite_media_download_url_replaces_any_http_origin_with_configured_origin():
@@ -885,12 +1150,12 @@ def test_pipeline_enqueue_file_routes_mp3_to_media_transcription(monkeypatch, tm
     )
 
 
-def test_media_transcription_uses_unique_task_id_per_enqueue(monkeypatch, tmp_path):
-    asyncio.run(_assert_media_transcription_uses_unique_task_id_per_enqueue(monkeypatch, tmp_path))
+def test_media_transcription_uses_deterministic_task_id(monkeypatch, tmp_path):
+    asyncio.run(_assert_media_transcription_uses_deterministic_task_id(monkeypatch, tmp_path))
 
 
-def test_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path):
-    asyncio.run(_assert_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path))
+def test_upload_media_returns_deterministic_task_doc_id(monkeypatch, tmp_path):
+    asyncio.run(_assert_upload_media_returns_deterministic_task_doc_id(monkeypatch, tmp_path))
 
 
 def test_scan_preserves_pending_media_transcription_status(monkeypatch, tmp_path):
@@ -1039,7 +1304,7 @@ async def _assert_pipeline_enqueue_file_routes_mp3_to_media_transcription(
     assert source.exists()
 
 
-async def _assert_media_transcription_uses_unique_task_id_per_enqueue(
+async def _assert_media_transcription_uses_deterministic_task_id(
     monkeypatch, tmp_path
 ):
     from lightrag.api.routers.document_routes import pipeline_enqueue_file
@@ -1077,12 +1342,15 @@ async def _assert_media_transcription_uses_unique_task_id_per_enqueue(
     assert first_success is True
     assert second_success is True
     assert len(calls) == 2
-    assert calls[0]["task_id"] != calls[1]["task_id"]
+    # Deterministic doc id: the same canonical file name yields the same task id
+    # across enqueues, so business systems can reconcile it (e.g. for
+    # /graph/hierarchy?root_id=resource:<doc_id>).
+    assert calls[0]["task_id"] == calls[1]["task_id"]
     assert await rag.doc_status.get_by_id(calls[0]["task_id"]) is not None
     assert await rag.doc_status.get_by_id(calls[1]["task_id"]) is not None
 
 
-async def _assert_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path):
+async def _assert_upload_media_returns_deterministic_task_doc_id(monkeypatch, tmp_path):
     calls = []
 
     async def fake_trigger(config, payload):
@@ -1134,7 +1402,9 @@ async def _assert_upload_media_returns_unique_task_doc_id(monkeypatch, tmp_path)
     )
 
     assert response.status == "success"
-    assert response.doc_id != compute_mdhash_id("voice.mp3", prefix="doc-")
+    # Deterministic doc id: matches the normal-file formula so the business can
+    # reconcile it (e.g. /graph/hierarchy?root_id=resource:<doc_id>).
+    assert response.doc_id == compute_mdhash_id("voice.mp3", prefix="doc-")
     assert len(bg.tasks) == 1
     for task in bg.tasks:
         await task.func(*task.args, **task.kwargs)

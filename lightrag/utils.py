@@ -862,7 +862,6 @@ def priority_limit_async_func_call(
     max_queue_size: int = 1000,
     cleanup_timeout: float = 2.0,
     queue_name: str = "limit_async",
-    startup_log_context: str | None = None,
 ):
     """
     Enhanced priority-limited asynchronous function call decorator with robust timeout handling
@@ -881,7 +880,6 @@ def priority_limit_async_func_call(
         max_task_duration: Maximum time before health check intervenes (defaults to llm_timeout + 60s)
         cleanup_timeout: Maximum time to wait for cleanup operations (defaults to 2.0s)
         queue_name: Optional queue name for logging identification (defaults to "limit_async")
-        startup_log_context: Optional extra startup context included in worker initialization logs
 
     Returns:
         Decorator function
@@ -1136,17 +1134,11 @@ def priority_limit_async_func_call(
                 if max_task_duration is not None:
                     timeout_info.append(f"Health Check: {max_task_duration}s")
 
-                startup_info = []
-                if startup_log_context:
-                    startup_info.append(startup_log_context)
-                if timeout_info:
-                    startup_info.append(f"Timeouts: {', '.join(timeout_info)}")
-
-                startup_info_str = (
-                    f"({'; '.join(startup_info)})" if startup_info else ""
+                timeout_str = (
+                    f"(Timeouts: {', '.join(timeout_info)})" if timeout_info else ""
                 )
                 logger.info(
-                    f"{queue_name}: {workers_needed} new workers initialized {startup_info_str}"
+                    f"{queue_name}: {workers_needed} new workers initialized {timeout_str}"
                 )
 
         async def get_queue_stats():

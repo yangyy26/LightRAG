@@ -570,20 +570,6 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
     )
     """Minimum confidence required to accept an LLM parent assignment."""
 
-    hierarchy_enable_semantic_candidate_filter: bool = field(
-        default_factory=lambda: get_env_value(
-            "HIERARCHY_ENABLE_SEMANTIC_CANDIDATE_FILTER", True, bool
-        )
-    )
-    """If True, hierarchy parent-assignment LLM may reject non-knowledge candidates."""
-
-    hierarchy_enable_hard_candidate_filter: bool = field(
-        default_factory=lambda: get_env_value(
-            "HIERARCHY_ENABLE_HARD_CANDIDATE_FILTER", True, bool
-        )
-    )
-    """If True, remove obvious non-knowledge hierarchy candidates before LLM assignment."""
-
     hierarchy_max_parallel_batches: int = field(
         default_factory=lambda: get_env_value("HIERARCHY_MAX_PARALLEL_BATCHES", 3, int)
     )
