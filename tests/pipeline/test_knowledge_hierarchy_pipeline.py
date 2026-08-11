@@ -57,15 +57,55 @@ class FakeFullDocs:
         return {"content": "Title: Verified Resource Title: Norms, Theory, and Values"}
 
 
+def make_minimal_hierarchy():
+    root = HierarchyNode(
+        entity_id="resource:doc-a",
+        entity_name="trees.pdf",
+        entity_type="Resource",
+        description="trees.pdf",
+        source_id="",
+        file_path="trees.pdf",
+        hierarchy_kind="root",
+        root_id="resource:doc-a",
+        parent_id=None,
+        level=0,
+    )
+    child = HierarchyNode(
+        entity_id="resource:doc-a:kp:tree",
+        entity_name="Tree",
+        entity_type="KnowledgePoint",
+        description="A tree concept.",
+        source_id="chunk-a",
+        file_path="trees.pdf",
+        hierarchy_kind="knowledge_point",
+        root_id="resource:doc-a",
+        parent_id="resource:doc-a",
+        level=1,
+    )
+    return NormalizedHierarchy(
+        root=root,
+        nodes=[child],
+        edges=[
+            (
+                "resource:doc-a",
+                "resource:doc-a:kp:tree",
+                {
+                    "edge_type": "hierarchy",
+                    "root_id": "resource:doc-a",
+                    "parent_id": "resource:doc-a",
+                },
+            )
+        ],
+    )
+
+
 @pytest.mark.asyncio
 async def test_maybe_build_knowledge_hierarchy_calls_builder_and_persists(monkeypatch):
     calls = []
 
     async def fake_build_resource_knowledge_hierarchy(**kwargs):
         calls.append(("build", kwargs["doc_id"]))
-        return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
-        )
+        return make_minimal_hierarchy()
 
     async def fake_persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb):
         calls.append(("persist", hierarchy.root.entity_id))
@@ -127,9 +167,7 @@ async def test_maybe_build_knowledge_hierarchy_passes_grounding_text(monkeypatch
 
     async def fake_build_resource_knowledge_hierarchy(**kwargs):
         captured["grounding_text"] = kwargs["grounding_text"]
-        return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
-        )
+        return make_minimal_hierarchy()
 
     async def fake_persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb):
         return True
@@ -179,9 +217,7 @@ async def test_schedule_knowledge_hierarchy_returns_before_builder_finishes(monk
     async def slow_build_resource_knowledge_hierarchy(**kwargs):
         started.set()
         await finish.wait()
-        return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
-        )
+        return make_minimal_hierarchy()
 
     async def fake_persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb):
         return True
@@ -247,9 +283,46 @@ async def test_maybe_build_knowledge_hierarchy_flushes_after_persist(monkeypatch
             parent_id=None,
             level=0,
         )
-        return SimpleNamespace(
+        return NormalizedHierarchy(
             root=root,
-            nodes=[],
+            nodes=[
+                HierarchyNode(
+                    entity_id="Photosynthesis",
+                    entity_name="Photosynthesis",
+                    entity_type="KnowledgePoint",
+                    description="Photosynthesis.",
+                    source_id="chunk-a",
+                    file_path="trees.pdf",
+                    hierarchy_kind="knowledge_point",
+                    root_id="resource:doc-a",
+                    parent_id="resource:doc-a",
+                    level=1,
+                ),
+                HierarchyNode(
+                    entity_id="Chlorophyll",
+                    entity_name="Chlorophyll",
+                    entity_type="KnowledgePoint",
+                    description="Chlorophyll.",
+                    source_id="chunk-a",
+                    file_path="trees.pdf",
+                    hierarchy_kind="knowledge_point",
+                    root_id="resource:doc-a",
+                    parent_id="Photosynthesis",
+                    level=2,
+                ),
+                HierarchyNode(
+                    entity_id="Light Reaction",
+                    entity_name="Light Reaction",
+                    entity_type="KnowledgePoint",
+                    description="Light reaction.",
+                    source_id="chunk-a",
+                    file_path="trees.pdf",
+                    hierarchy_kind="knowledge_point",
+                    root_id="resource:doc-a",
+                    parent_id="Photosynthesis",
+                    level=2,
+                ),
+            ],
             edges=[
                 (
                     "resource:doc-a",
@@ -363,9 +436,7 @@ async def test_maybe_build_knowledge_hierarchy_failure_is_soft(monkeypatch):
 async def test_maybe_build_knowledge_hierarchy_timeout_is_soft(monkeypatch):
     async def slow_build_resource_knowledge_hierarchy(**kwargs):
         await asyncio.sleep(0.05)
-        return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
-        )
+        return make_minimal_hierarchy()
 
     persist = AsyncMock()
     monkeypatch.setattr(
@@ -421,9 +492,7 @@ async def test_hierarchy_build_updates_pipeline_status_without_main_busy(monkeyp
         assert pipeline_status["busy"] is False
         assert pipeline_status["hierarchy_busy"] is True
         assert pipeline_status["hierarchy_current_doc"] == "doc-a"
-        return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
-        )
+        return make_minimal_hierarchy()
 
     async def fake_persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb):
         return True
@@ -483,9 +552,7 @@ async def test_maybe_build_knowledge_hierarchy_augments_candidates_from_final_gr
 
     async def fake_build_resource_knowledge_hierarchy(**kwargs):
         captured["chunk_results"] = kwargs["chunk_results"]
-        return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
-        )
+        return make_minimal_hierarchy()
 
     async def fake_persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb):
         return True
@@ -609,7 +676,15 @@ async def test_maybe_build_knowledge_hierarchy_records_skip_reason(monkeypatch):
 async def test_maybe_build_knowledge_hierarchy_records_persist_failure(monkeypatch):
     async def fake_build_resource_knowledge_hierarchy(**kwargs):
         return SimpleNamespace(
-            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
+            root=SimpleNamespace(entity_id="resource:doc-a"),
+            nodes=[SimpleNamespace(entity_id="resource:doc-a:kp:tree")],
+            edges=[
+                (
+                    "resource:doc-a:kp:tree",
+                    "resource:doc-a",
+                    {},
+                )
+            ],
         )
 
     async def fake_persist_resource_knowledge_hierarchy(hierarchy, graph, entity_vdb):
@@ -651,7 +726,55 @@ async def test_maybe_build_knowledge_hierarchy_records_persist_failure(monkeypat
 
     metadata = harness.doc_status.docs["doc-a"]["metadata"]
     assert metadata["hierarchy_status"] == "failed"
-    assert "could not be persisted" in metadata["hierarchy_error"]
+    assert "generated edges" in metadata["hierarchy_error"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_build_knowledge_hierarchy_reports_empty_classification(monkeypatch):
+    async def fake_build_resource_knowledge_hierarchy(**kwargs):
+        return SimpleNamespace(
+            root=SimpleNamespace(entity_id="resource:doc-a"), nodes=[], edges=[]
+        )
+
+    persist = AsyncMock()
+    monkeypatch.setattr(
+        pipeline_module,
+        "build_resource_knowledge_hierarchy",
+        fake_build_resource_knowledge_hierarchy,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "persist_resource_knowledge_hierarchy",
+        persist,
+        raising=False,
+    )
+
+    class Harness(_PipelineMixin):
+        enable_knowledge_hierarchy = True
+        chunk_entity_relation_graph = AsyncMock()
+        entities_vdb = AsyncMock()
+
+        def __init__(self):
+            self.doc_status = FakeDocStatus()
+
+        def _build_global_config(self):
+            return {"enable_knowledge_hierarchy": True}
+
+        async def _insert_done(self):
+            pass
+
+    harness = Harness()
+    await harness._maybe_build_knowledge_hierarchy(
+        doc_id="doc-a",
+        file_path="trees.pdf",
+        chunk_results=[({}, {})],
+    )
+
+    persist.assert_not_awaited()
+    metadata = harness.doc_status.docs["doc-a"]["metadata"]
+    assert metadata["hierarchy_status"] == "failed"
+    assert "No eligible knowledge points remained" in metadata["hierarchy_error"]
 
 
 @pytest.mark.asyncio

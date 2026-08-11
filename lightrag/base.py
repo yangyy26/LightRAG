@@ -138,6 +138,9 @@ class QueryParam:
     hierarchy_child_depth: int = int(os.getenv("HIERARCHY_CHILD_DEPTH", "1"))
     """Number of child levels to include for matched knowledge points."""
 
+    expand_layer: int = int(os.getenv("EXPAND_LAYER", "0"))
+    """When non-zero, override hierarchy parent and child expansion with one shared depth."""
+
     hierarchy_sibling_limit: int = int(os.getenv("HIERARCHY_SIBLING_LIMIT", "5"))
     """Maximum number of sibling knowledge points to include per matched node."""
 

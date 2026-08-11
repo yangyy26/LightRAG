@@ -228,7 +228,7 @@ const createSigmaGraph = (rawGraph: RawGraph | null) => {
     const isHierarchyEdge = rawEdge.properties?.edge_type === 'hierarchy'
 
     rawEdge.dynamicId = graph.addEdge(rawEdge.source, rawEdge.target, {
-      label: isHierarchyEdge ? 'contains' : rawEdge.properties?.keywords || undefined,
+      label: isHierarchyEdge ? rawEdge.properties?.relation_type || 'part_of' : rawEdge.properties?.keywords || undefined,
       size: weight, // Set initial size based on weight
       originalWeight: weight, // Store original weight for recalculation
       edgeType: rawEdge.properties?.edge_type,
@@ -784,7 +784,7 @@ const useLightrangeGraph = () => {
 
           // Add the edge to the sigma graph
           newEdge.dynamicId = sigmaGraph.addEdge(newEdge.source, newEdge.target, {
-            label: isHierarchyEdge ? 'contains' : newEdge.properties?.keywords || undefined,
+            label: isHierarchyEdge ? newEdge.properties?.relation_type || 'part_of' : newEdge.properties?.keywords || undefined,
             size: weight, // Set initial size based on weight
             originalWeight: weight, // Store original weight for recalculation
             edgeType: newEdge.properties?.edge_type,

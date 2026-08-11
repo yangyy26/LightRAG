@@ -5,7 +5,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lightrag.api.routers import graph_routes
-from lightrag.knowledge_hierarchy import get_all_hierarchy_trees, get_hierarchy_tree
+from lightrag.knowledge_hierarchy import (
+    get_all_hierarchy_trees,
+    get_hierarchy_tree,
+    get_knowledge_point_subtree,
+)
 from lightrag.lightrag import LightRAG
 from lightrag.types import KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode
 
@@ -49,6 +53,58 @@ async def test_get_hierarchy_tree_returns_nested_children():
     assert tree["children"][0]["entity_id"] == "Tree"
     assert tree["children"][0]["entity_name"] == "Tree"
     assert tree["children"][0]["source_id"] == "chunk-a"
+
+
+@pytest.mark.asyncio
+async def test_get_knowledge_point_subtree_returns_only_the_requested_branch():
+    graph = AsyncMock()
+    graph.get_node.side_effect = lambda node_id: {
+        "resource:doc-a:kp:principle": {
+            "entity_id": "resource:doc-a:kp:principle",
+            "entity_name": "行刑原则",
+            "root_id": "resource:doc-a",
+            "node_type": "knowledge_point",
+        },
+        "resource:doc-a:kp:efficiency": {
+            "entity_id": "resource:doc-a:kp:efficiency",
+            "entity_name": "行刑效率原则",
+            "root_id": "resource:doc-a",
+            "node_type": "knowledge_point",
+        },
+        "resource:doc-a:kp:safety": {
+            "entity_id": "resource:doc-a:kp:safety",
+            "entity_name": "行刑安全原则",
+            "root_id": "resource:doc-a",
+            "node_type": "knowledge_point",
+        },
+    }.get(node_id)
+    graph.get_all_edges.return_value = [
+        {
+            "edge_type": "hierarchy",
+            "relation_type": "part_of",
+            "root_id": "resource:doc-a",
+            "parent_id": "resource:doc-a:kp:principle",
+            "child_id": "resource:doc-a:kp:efficiency",
+        },
+        {
+            "edge_type": "hierarchy",
+            "relation_type": "part_of",
+            "root_id": "resource:doc-a",
+            "parent_id": "resource:doc-a:kp:principle",
+            "child_id": "resource:doc-a:kp:safety",
+        },
+    ]
+
+    tree = await get_knowledge_point_subtree(
+        graph,
+        "resource:doc-a:kp:principle",
+    )
+
+    assert tree["entity_name"] == "行刑原则"
+    assert [item["entity_name"] for item in tree["children"]] == [
+        "行刑安全原则",
+        "行刑效率原则",
+    ]
 
 
 @pytest.mark.asyncio
@@ -554,6 +610,59 @@ def test_hierarchies_route_returns_all_workspace_resource_trees(monkeypatch):
     assert response.status_code == 200, response.text
     assert response.json() == {"items": trees, "count": 2}
     rag.get_knowledge_hierarchies.assert_awaited_once_with(max_depth=8)
+
+
+def test_knowledge_point_routes_return_subtree_and_associated_entities(monkeypatch):
+    subtree = {
+        "entity_id": "resource:doc-a:kp:principle",
+        "entity_name": "行刑原则",
+        "children": [],
+    }
+    associated_entities = [
+        {"name": "贝卡利亚", "type": "person", "relation": "proposed_by"}
+    ]
+    rag = type(
+        "FakeRAG",
+        (),
+        {
+            "workspace": "course_a",
+            "get_knowledge_point_subtree": AsyncMock(return_value=subtree),
+            "get_knowledge_point_associated_entities": AsyncMock(
+                return_value=associated_entities
+            ),
+        },
+    )()
+
+    async def allow_auth():
+        return None
+
+    monkeypatch.setattr(
+        graph_routes, "_get_router_auth_dependency", lambda _api_key: allow_auth
+    )
+
+    app = FastAPI()
+    app.include_router(graph_routes.create_graph_routes(rag, api_key=None))
+    client = TestClient(app)
+    knowledge_point_id = "resource:doc-a:kp:principle"
+
+    subtree_response = client.get(
+        f"/graph/knowledge-points/{knowledge_point_id}/subtree?max_depth=4"
+    )
+    entities_response = client.get(
+        f"/graph/knowledge-points/{knowledge_point_id}/associated-entities"
+    )
+
+    assert subtree_response.status_code == 200, subtree_response.text
+    assert subtree_response.json() == subtree
+    assert entities_response.status_code == 200, entities_response.text
+    assert entities_response.json() == {"items": associated_entities, "count": 1}
+    rag.get_knowledge_point_subtree.assert_awaited_once_with(
+        parent_id=knowledge_point_id,
+        max_depth=4,
+    )
+    rag.get_knowledge_point_associated_entities.assert_awaited_once_with(
+        knowledge_point_id
+    )
 
 
 def test_retry_hierarchy_route_schedules_document_hierarchy(monkeypatch):

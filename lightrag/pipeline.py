@@ -362,6 +362,27 @@ class _PipelineMixin:
                 )
                 return
 
+            if not hierarchy.nodes:
+                error = (
+                    "No eligible knowledge points remained after hierarchy "
+                    "classification, so there is no hierarchy to persist. "
+                    "Review the candidate entity types or semantic candidate "
+                    "filter configuration."
+                )
+                await self._set_knowledge_hierarchy_status(
+                    doc_id=doc_id,
+                    status=HIERARCHY_STATUS_FAILED,
+                    root_id=hierarchy.root.entity_id,
+                    error=error,
+                )
+                await self._set_hierarchy_pipeline_progress(
+                    status="failed",
+                    doc_id=doc_id,
+                    file_path=file_path,
+                    message=f"Knowledge hierarchy failed for `{file_path}`: {error}",
+                )
+                return
+
             await self._set_hierarchy_pipeline_progress(
                 status="processing",
                 doc_id=doc_id,
@@ -382,8 +403,8 @@ class _PipelineMixin:
             )
             if not persisted:
                 error = (
-                    "Knowledge hierarchy could not be persisted because no "
-                    "valid hierarchy edges matched existing graph nodes."
+                    "Knowledge hierarchy could not be persisted because its "
+                    "generated edges did not reference generated hierarchy nodes."
                 )
                 await self._set_knowledge_hierarchy_status(
                     doc_id=doc_id,

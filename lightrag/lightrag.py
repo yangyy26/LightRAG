@@ -1415,6 +1415,27 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             max_depth=max_depth,
         )
 
+    async def get_knowledge_point_subtree(
+        self, parent_id: str, max_depth: int = 20
+    ):
+        from lightrag.knowledge_hierarchy import get_knowledge_point_subtree
+
+        return await get_knowledge_point_subtree(
+            self.chunk_entity_relation_graph,
+            parent_id=parent_id,
+            max_depth=max_depth,
+        )
+
+    async def get_knowledge_point_associated_entities(
+        self, knowledge_point_id: str
+    ) -> list[dict[str, str]]:
+        from lightrag.knowledge_hierarchy import get_associated_entities
+
+        return await get_associated_entities(
+            self.chunk_entity_relation_graph,
+            knowledge_point_id=knowledge_point_id,
+        )
+
     async def cleanup_legacy_knowledge_hierarchy(self) -> dict[str, Any]:
         from lightrag.knowledge_hierarchy import cleanup_legacy_hierarchy_duplicates
 
@@ -2344,6 +2365,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             enable_hierarchy_context=param.enable_hierarchy_context,
             hierarchy_parent_depth=param.hierarchy_parent_depth,
             hierarchy_child_depth=param.hierarchy_child_depth,
+            expand_layer=param.expand_layer,
             hierarchy_sibling_limit=param.hierarchy_sibling_limit,
             max_hierarchy_tokens=param.max_hierarchy_tokens,
         )

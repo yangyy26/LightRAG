@@ -12,6 +12,7 @@ import unicodedata
 
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
+    compute_mdhash_id,
     get_llm_cache_identity,
     logger,
     split_string_by_multi_markers,
@@ -20,7 +21,6 @@ from lightrag.utils import (
 
 
 HIERARCHY_EDGE_TYPE = "hierarchy"
-HIERARCHY_RELATION_TYPE = "contains"
 HIERARCHY_ROOT_KIND = "root"
 HIERARCHY_KP_KIND = "knowledge_point"
 HIERARCHY_STATUS_PROCESSING = "processing"
@@ -49,6 +49,10 @@ class ParentAssignment:
     confidence: float
     reason: str = ""
     decision: str = "assign"
+    relation_to_parent: str = "part_of"
+    canonical_name: str | None = None
+    associated_entities: list[dict[str, str]] = field(default_factory=list)
+    prerequisites: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -64,6 +68,9 @@ class HierarchyNode:
     parent_id: str | None
     level: int
     hierarchy_confidence: float = 1.0
+    aliases: list[str] = field(default_factory=list)
+    associated_entities: list[dict[str, str]] = field(default_factory=list)
+    prerequisite_ids: list[str] = field(default_factory=list)
 
     def to_graph_data(self) -> dict[str, Any]:
         data = {
@@ -71,16 +78,33 @@ class HierarchyNode:
             "entity_name": self.entity_name,
             "entity_type": self.entity_type,
             "description": self.description,
+            "definition": self.description,
             "source_id": self.source_id,
             "file_path": self.file_path,
             "hierarchy_kind": self.hierarchy_kind,
             "root_id": self.root_id,
             "level": self.level,
+            "layer": self.level,
         }
         if self.hierarchy_kind == HIERARCHY_ROOT_KIND and self.entity_id.startswith(
             "resource:"
         ):
             data["doc_id"] = self.entity_id.removeprefix("resource:")
+            data["node_type"] = "resource"
+        else:
+            data["node_type"] = "knowledge_point"
+            # GraphML supports scalar attribute values only, while backends such
+            # as Neo4j do not support a list of maps. Store all collection
+            # properties as portable JSON strings.
+            data["aliases"] = json.dumps(
+                self.aliases or [self.entity_name], ensure_ascii=False
+            )
+            data["associated_entities"] = json.dumps(
+                self.associated_entities, ensure_ascii=False
+            )
+            data["prerequisite_ids"] = json.dumps(
+                self.prerequisite_ids, ensure_ascii=False
+            )
         if self.parent_id is not None:
             data["parent_id"] = self.parent_id
             data["hierarchy_confidence"] = self.hierarchy_confidence
@@ -100,6 +124,12 @@ def normalize_knowledge_point_name(name: str) -> str:
 
 def make_resource_root_id(doc_id: str) -> str:
     return f"resource:{doc_id}"
+
+
+def make_knowledge_point_id(root_id: str, canonical_name: str) -> str:
+    """Return a stable document-local identifier for a knowledge point."""
+    canonical_key = normalize_knowledge_point_name(canonical_name)
+    return f"{root_id}:kp:{compute_mdhash_id(canonical_key)}"
 
 
 def _merge_source_ids(left: list[str], right: str | list[str] | None) -> list[str]:
@@ -256,6 +286,57 @@ def filter_hierarchy_candidates_by_hard_rules(
     if removed:
         logger.info(
             "Filtered obvious non-knowledge hierarchy candidates: kept=%d, removed=%d",
+            len(filtered),
+            removed,
+        )
+    return filtered
+
+
+_BARE_ENTITY_TYPES = {
+    "person",
+    "organization",
+    "location",
+    "content",
+    "artifact",
+    "naturalobject",
+    "creature",
+    "data",
+}
+
+_TAXONOMIC_ARTIFACT_RE = re.compile(
+    r"(?:^第?(?:\d+|[一二三四五六七八九十百千万]+)代|"
+    r"(?:类型|型号|版本|系列|类别|分类|等级|级别|标准|规范)$|"
+    r"\b(?:generation|version|model|type|class|series|standard)\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_explanatory_concept(name: str) -> bool:
+    normalized = str(name or "").strip().lower()
+    return "的" in normalized or "'s " in normalized or " of " in normalized
+
+
+def _looks_like_taxonomic_artifact(candidate: HierarchyCandidate) -> bool:
+    return candidate.entity_type.lower() in {"artifact", "content"} and bool(
+        _TAXONOMIC_ARTIFACT_RE.search(candidate.name)
+    )
+
+
+def filter_bare_named_entity_candidates(
+    candidates: dict[str, HierarchyCandidate],
+) -> dict[str, HierarchyCandidate]:
+    """Remove unambiguous named entities before an LLM fallback can root them."""
+    filtered = {
+        key: candidate
+        for key, candidate in candidates.items()
+        if candidate.entity_type.lower() not in _BARE_ENTITY_TYPES
+        or _looks_like_explanatory_concept(candidate.name)
+        or _looks_like_taxonomic_artifact(candidate)
+    }
+    removed = len(candidates) - len(filtered)
+    if removed:
+        logger.info(
+            "Filtered bare named-entity hierarchy candidates: kept=%d, removed=%d",
             len(filtered),
             removed,
         )
@@ -546,18 +627,20 @@ def _repair_flat_hierarchy_from_relations(
 def _make_hierarchy_edge(
     parent_id: str,
     child: HierarchyNode,
+    relation_type: str = "part_of",
+    child_to_parent: bool = False,
 ) -> tuple[str, str, dict[str, Any]]:
     return (
-        parent_id,
-        child.entity_id,
+        child.entity_id if child_to_parent else parent_id,
+        parent_id if child_to_parent else child.entity_id,
         {
-            "description": "Parent contains child in the resource knowledge hierarchy.",
-            "keywords": "contains,hierarchy",
+            "description": "Knowledge point belongs to its parent in the resource knowledge hierarchy.",
+            "keywords": f"{relation_type},hierarchy",
             "weight": 1.0,
             "source_id": child.source_id,
             "file_path": child.file_path,
             "edge_type": HIERARCHY_EDGE_TYPE,
-            "relation_type": HIERARCHY_RELATION_TYPE,
+            "relation_type": relation_type,
             "root_id": child.root_id,
             "parent_id": parent_id,
             "child_id": child.entity_id,
@@ -756,9 +839,50 @@ def normalize_assignments_to_hierarchy(
         if assignment.decision == "reject"
         and _assignment_key(assignment.child) in candidate_by_name
     }
-    parent_by_key: dict[str, str] = {}
+    active_keys = set(candidates) - rejected_keys
+    if not active_keys and candidates:
+        # A classifier can over-filter a resource in one pass. Keep a flat
+        # hierarchy in that case instead of losing all graph coverage.
+        logger.warning(
+            "All hierarchy candidates were rejected for %s; falling back to root-level knowledge points",
+            root_id,
+        )
+        active_keys = set(candidates)
 
+    # The extraction LLM may report a canonical name for a synonym. Collapse
+    # aliases before choosing parents so aliases cannot form a second branch.
+    canonical_by_key = {key: key for key in active_keys}
     ranked = sorted(assignments, key=lambda item: item.confidence, reverse=True)
+    for assignment in ranked:
+        child_key = candidate_by_name.get(_assignment_key(assignment.child))
+        canonical_key = candidate_by_name.get(
+            _assignment_key(assignment.canonical_name or assignment.child)
+        )
+        if (
+            child_key not in active_keys
+            or canonical_key not in active_keys
+            or child_key is None
+            or canonical_key is None
+        ):
+            continue
+        canonical_by_key[child_key] = canonical_key
+
+    def resolve_canonical(key: str) -> str:
+        path: list[str] = []
+        current = key
+        while canonical_by_key.get(current, current) != current:
+            if current in path:
+                return min(path[path.index(current) :])
+            path.append(current)
+            current = canonical_by_key[current]
+        return current
+
+    groups: dict[str, list[str]] = {}
+    for key in sorted(active_keys):
+        groups.setdefault(resolve_canonical(key), []).append(key)
+
+    parent_by_key: dict[str, str] = {}
+    relation_by_child: dict[str, str] = {}
     for assignment in ranked:
         if assignment.decision != "assign":
             continue
@@ -766,7 +890,11 @@ def normalize_assignments_to_hierarchy(
             continue
         child_key = candidate_by_name.get(_assignment_key(assignment.child))
         parent_key = candidate_by_name.get(_assignment_key(assignment.parent))
-        if not child_key or not parent_key or child_key == parent_key:
+        if not child_key or not parent_key:
+            continue
+        child_key = resolve_canonical(child_key)
+        parent_key = resolve_canonical(parent_key)
+        if child_key == parent_key or child_key not in groups or parent_key not in groups:
             continue
         if child_key in parent_by_key:
             continue
@@ -775,35 +903,138 @@ def normalize_assignments_to_hierarchy(
         if _has_compound_candidate_conflict(child_key, parent_key, candidates):
             continue
         parent_by_key[child_key] = parent_key
+        relation_by_child[child_key] = assignment.relation_to_parent
         if _assignment_depth(child_key, parent_by_key) > max_depth:
             parent_by_key.pop(child_key, None)
+            relation_by_child.pop(child_key, None)
 
+    associated_by_key: dict[str, list[dict[str, str]]] = {
+        key: [] for key in groups
+    }
+    prerequisites_by_key: dict[str, list[str]] = {key: [] for key in groups}
+    for assignment in ranked:
+        if assignment.decision == "reject":
+            continue
+        child_key = candidate_by_name.get(_assignment_key(assignment.child))
+        if child_key is None or child_key not in active_keys:
+            continue
+        canonical_key = resolve_canonical(child_key)
+        if canonical_key not in groups:
+            continue
+        seen_associations = {
+            (item["name"], item.get("type", ""), item["relation"])
+            for item in associated_by_key[canonical_key]
+        }
+        alias_names = {
+            normalize_knowledge_point_name(candidates[key].name)
+            for key in groups[canonical_key]
+        }
+        for entity in assignment.associated_entities:
+            association_key = (
+                entity["name"],
+                entity.get("type", ""),
+                entity["relation"],
+            )
+            if (
+                normalize_knowledge_point_name(entity["name"]) in alias_names
+                or association_key in seen_associations
+            ):
+                continue
+            associated_by_key[canonical_key].append(entity)
+            seen_associations.add(association_key)
+        for prerequisite in assignment.prerequisites:
+            prerequisite_key = candidate_by_name.get(_assignment_key(prerequisite))
+            if prerequisite_key is None or prerequisite_key not in active_keys:
+                continue
+            prerequisite_key = resolve_canonical(prerequisite_key)
+            if (
+                prerequisite_key != canonical_key
+                and prerequisite_key in groups
+                and prerequisite_key not in prerequisites_by_key[canonical_key]
+            ):
+                prerequisites_by_key[canonical_key].append(prerequisite_key)
+
+    kp_id_by_key = {
+        key: make_knowledge_point_id(root_id, candidates[key].name)
+        for key in groups
+    }
+    nodes: list[HierarchyNode] = []
     edges: list[tuple[str, str, dict[str, Any]]] = []
-    for key in sorted(key for key in candidates if key not in rejected_keys):
+    for key in sorted(groups):
+        group = groups[key]
         candidate = candidates[key]
         parent_key = parent_by_key.get(key)
         if parent_key:
-            parent_id = candidates[parent_key].name
+            parent_id = kp_id_by_key[parent_key]
             level = _assignment_depth(key, parent_by_key)
         else:
             parent_id = root_id
             level = 1
+        aliases = [candidate.name] + [
+            candidates[alias_key].name
+            for alias_key in group
+            if alias_key != key
+        ]
+        source_ids: list[str] = []
+        definition = candidate.description
+        for alias_key in group:
+            source_ids = _merge_source_ids(source_ids, candidates[alias_key].source_ids)
+            if len(candidates[alias_key].description) > len(definition):
+                definition = candidates[alias_key].description
         child = HierarchyNode(
-            entity_id=candidate.name,
+            entity_id=kp_id_by_key[key],
             entity_name=candidate.name,
-            entity_type=candidate.entity_type or "KnowledgePoint",
-            description=candidate.description,
-            source_id=_source_id_from_candidate(candidate),
+            entity_type="KnowledgePoint",
+            description=definition,
+            source_id=GRAPH_FIELD_SEP.join(source_ids),
             file_path=candidate.file_path,
             hierarchy_kind=HIERARCHY_KP_KIND,
             root_id=root_id,
             parent_id=parent_id,
             level=level,
             hierarchy_confidence=1.0,
+            aliases=aliases,
+            associated_entities=associated_by_key[key],
+            prerequisite_ids=[kp_id_by_key[item] for item in prerequisites_by_key[key]],
         )
-        edges.append(_make_hierarchy_edge(parent_id, child))
+        nodes.append(child)
+        edges.append(
+            _make_hierarchy_edge(
+                parent_id,
+                child,
+                relation_by_child.get(key, "part_of"),
+                child_to_parent=True,
+            )
+        )
 
-    return NormalizedHierarchy(root=root, nodes=[], edges=edges)
+    hierarchy_pairs = {
+        frozenset((edge_data["child_id"], edge_data["parent_id"]))
+        for _src, _tgt, edge_data in edges
+    }
+    for node in nodes:
+        for prerequisite_id in node.prerequisite_ids:
+            if frozenset((node.entity_id, prerequisite_id)) in hierarchy_pairs:
+                continue
+            edges.append(
+                (
+                    node.entity_id,
+                    prerequisite_id,
+                    {
+                        "description": "Knowledge point has a horizontal prerequisite dependency.",
+                        "keywords": "prerequisite",
+                        "weight": 1.0,
+                        "source_id": node.source_id,
+                        "file_path": node.file_path,
+                        "edge_type": "knowledge_relation",
+                        "relation_type": "prerequisite",
+                        "root_id": root_id,
+                        "source_kp_id": node.entity_id,
+                        "target_kp_id": prerequisite_id,
+                    },
+                )
+            )
+
+    return NormalizedHierarchy(root=root, nodes=nodes, edges=edges)
 
 
 def _build_hierarchy_prompt(
@@ -875,6 +1106,7 @@ def _build_parent_assignment_prompt(
             "parent": item.parent,
             "confidence": item.confidence,
             "decision": item.decision,
+            "canonical_name": item.canonical_name,
         }
         for item in current_assignments
     ]
@@ -882,11 +1114,19 @@ def _build_parent_assignment_prompt(
         response_shape = (
             '{"assignments": [{"child": string, "parent": string|null, '
             '"confidence": number, "decision": "assign"|"root"|"reject", '
-            '"reason": string}]}.\n'
-            'Use decision="reject" only when the child is not a meaningful resource '
-            "knowledge point, such as lesson markers, dates, page numbers, serial "
-            "numbers, document-structure labels, administrative metadata, or vague "
-            "non-concept labels.\n"
+            '"relation_to_parent": "is_a"|"part_of", "canonical_name": string, '
+            '"associated_entities": [{"name": string, "type": string, '
+            '"relation": "proposed_by"|"source_of"|"instance_of"}], '
+            '"prerequisites": [string], "reason": string}]}.\n'
+            'Use decision="reject" for every bare named entity: person, school, '
+            "company, organization, place, statute number, case number, book, or "
+            "document title. Also reject lesson markers, dates, page numbers, serial "
+            "numbers, document-structure labels, administrative metadata, and vague "
+            "non-concept labels. A phrase such as a person's named theory is a valid "
+            "knowledge point when it can be defined. A domain-specific category, "
+            "type, generation, version, or model is also a valid knowledge point "
+            "when its description defines it or places it in a taxonomy, even when "
+            "its extracted entity type is Artifact or Content.\n"
             'Use decision="root" when the child is a valid knowledge point but has '
             "no clear parent.\n"
         )
@@ -901,9 +1141,17 @@ def _build_parent_assignment_prompt(
     return (
         "Assign each unresolved child knowledge point to the best parent.\n"
         "Use the document context, entity descriptions, and extracted relations to "
-        "infer semantic hierarchy.\n"
+        "infer semantic hierarchy. A knowledge point is a concept, principle, "
+        "institution, rule, theory, or method that can be defined or explained.\n"
         "Use only provided parent candidate names, or null when no parent is clear.\n"
         "Do not invent nodes. Do not assign a child to itself.\n"
+        "Use is_a only for a subtype and part_of only for a component/aspect. "
+        "Prerequisites are horizontal and must not be used as parents.\n"
+        "canonical_name must be the child name or another provided candidate name. "
+        "Use it to merge genuine synonyms, such as a concept and the same concept "
+        "with a trailing 'principle' label.\n"
+        "associated_entities may reference only provided candidates that are bare "
+        "named entities; do not turn those entities into hierarchy nodes.\n"
         "Return JSON only with shape: "
         f"{response_shape}"
         f"Root title: {root_title}\n"
@@ -1018,6 +1266,36 @@ def parse_parent_assignments(raw: Any) -> list[ParentAssignment]:
         decision = str(row.get("decision") or "").strip().lower()
         if decision not in {"assign", "root", "reject"}:
             decision = "assign" if parent else "root"
+        relation_to_parent = str(row.get("relation_to_parent") or "").strip().lower()
+        if relation_to_parent not in {"is_a", "part_of"}:
+            relation_to_parent = "part_of"
+        canonical_name = str(row.get("canonical_name") or "").strip() or None
+        associated_entities = []
+        raw_associated_entities = row.get("associated_entities", [])
+        if isinstance(raw_associated_entities, list):
+            for item in raw_associated_entities:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                entity_type = str(item.get("type") or "").strip()
+                relation = str(item.get("relation") or "").strip().lower()
+                if not name or relation not in {
+                    "proposed_by",
+                    "source_of",
+                    "instance_of",
+                }:
+                    continue
+                associated_entities.append(
+                    {"name": name, "type": entity_type, "relation": relation}
+                )
+        prerequisites = []
+        raw_prerequisites = row.get("prerequisites", [])
+        if isinstance(raw_prerequisites, list):
+            prerequisites = [
+                value
+                for value in (str(item).strip() for item in raw_prerequisites)
+                if value
+            ]
         assignments.append(
             ParentAssignment(
                 child=child,
@@ -1025,6 +1303,10 @@ def parse_parent_assignments(raw: Any) -> list[ParentAssignment]:
                 confidence=max(0.0, min(confidence, 1.0)),
                 reason=reason,
                 decision=decision,
+                relation_to_parent=relation_to_parent,
+                canonical_name=canonical_name,
+                associated_entities=associated_entities,
+                prerequisites=prerequisites,
             )
         )
     return assignments
@@ -1064,12 +1346,20 @@ async def build_resource_knowledge_hierarchy(
         candidate_entity_types=[str(item).lower() for item in candidate_types],
         file_path=file_path,
     )
-    candidates = filter_hierarchy_candidates_by_grounding(
+    grounded_candidates = filter_hierarchy_candidates_by_grounding(
         candidates,
         grounding_text,
     )
+    if grounded_candidates or not candidates:
+        candidates = grounded_candidates
+    else:
+        logger.info(
+            "Grounding filter removed every hierarchy candidate for `%s`; retaining candidates for semantic classification",
+            file_path,
+        )
     if bool(global_config.get("hierarchy_enable_hard_candidate_filter", True)):
         candidates = filter_hierarchy_candidates_by_hard_rules(candidates)
+    candidates = filter_bare_named_entity_candidates(candidates)
     if not candidates:
         logger.info(
             "No hierarchy candidates found for `%s` (candidate_entity_types=%s)",
@@ -1114,22 +1404,15 @@ async def build_resource_knowledge_hierarchy(
         global_config.get("hierarchy_enable_semantic_candidate_filter", True)
     )
 
-    assignments = assign_parents_from_relations(all_candidates, relations)
-    assigned_children = {
-        normalize_knowledge_point_name(item.child)
-        for item in assignments
-        if item.parent and item.confidence >= min_confidence
-    }
-    rejected_children = {
-        normalize_knowledge_point_name(item.child)
-        for item in assignments
-        if item.decision == "reject"
-    }
-    rooted_children = {
-        normalize_knowledge_point_name(item.child)
-        for item in assignments
-        if item.decision == "root"
-    }
+    # Do not pre-assign from the legacy entity relations. Every candidate must
+    # first pass the knowledge-point vs. named-entity classification prompt;
+    # otherwise a person or organization supported by a relation could bypass
+    # the semantic rejection step and become a tree node.
+    assignments: list[ParentAssignment] = []
+    relation_assignments = assign_parents_from_relations(all_candidates, relations)
+    assigned_children: set[str] = set()
+    rejected_children: set[str] = set()
+    rooted_children: set[str] = set()
 
     for _round in range(max(0, max_rounds)):
         progress_count_before_round = (
@@ -1216,6 +1499,16 @@ async def build_resource_knowledge_hierarchy(
         if progress_count_after_round == progress_count_before_round:
             break
 
+    # Reuse strongly signalled legacy relations only for candidates the
+    # classifier left unresolved. This preserves useful hierarchy evidence
+    # without allowing a raw entity relation to bypass semantic filtering.
+    decided_children = assigned_children | rooted_children | rejected_children
+    assignments.extend(
+        assignment
+        for assignment in relation_assignments
+        if normalize_knowledge_point_name(assignment.child) not in decided_children
+    )
+
     return normalize_assignments_to_hierarchy(
         root_id=root_id,
         root_title=root_title,
@@ -1265,27 +1558,23 @@ async def persist_resource_knowledge_hierarchy(
     entity_vdb,
 ) -> bool:
     root_id = hierarchy.root.entity_id
-    endpoint_ids = {
-        node_id
-        for src, tgt, _data in hierarchy.edges
-        for node_id in (src, tgt)
-        if node_id != root_id
+    node_by_id = {
+        node.entity_id: node for node in [hierarchy.root, *hierarchy.nodes]
     }
-    existing_endpoints = (
-        await knowledge_graph_inst.has_nodes_batch(list(endpoint_ids))
-        if endpoint_ids
-        else set()
-    )
+    node_ids = set(node_by_id)
     valid_edges = [
         (src, tgt, data)
         for src, tgt, data in hierarchy.edges
-        if (src == root_id or src in existing_endpoints)
-        and (tgt == root_id or tgt in existing_endpoints)
+        if src in node_ids and tgt in node_ids
     ]
     existing_edges = await knowledge_graph_inst.get_all_edges()
     stale_edges = []
     for edge in existing_edges:
-        if edge.get("edge_type") != HIERARCHY_EDGE_TYPE or edge.get("root_id") != root_id:
+        if (
+            edge.get("edge_type")
+            not in {HIERARCHY_EDGE_TYPE, "knowledge_relation"}
+            or edge.get("root_id") != root_id
+        ):
             continue
         source = edge.get("source") or edge.get("source_node_id") or edge.get("src_id")
         target = edge.get("target") or edge.get("target_node_id") or edge.get("tgt_id")
@@ -1294,6 +1583,32 @@ async def persist_resource_knowledge_hierarchy(
     if stale_edges:
         await knowledge_graph_inst.remove_edges(stale_edges)
 
+    # Each document owns its hierarchy nodes. Remove knowledge points that
+    # disappeared during a rebuild, while leaving the legacy entity graph
+    # untouched for existing retrieval modes.
+    stale_node_ids: list[str] = []
+    try:
+        existing_nodes = await knowledge_graph_inst.get_all_nodes()
+    except Exception as exc:
+        logger.debug("Unable to load existing hierarchy nodes for %s: %s", root_id, exc)
+        existing_nodes = []
+    if isinstance(existing_nodes, list):
+        for node in existing_nodes:
+            node_id = str(node.get("entity_id") or node.get("id") or "")
+            if (
+                node_id
+                and node_id not in node_ids
+                and node.get("root_id") == root_id
+                and node.get("node_type") == "knowledge_point"
+            ):
+                stale_node_ids.append(node_id)
+    if stale_node_ids:
+        await knowledge_graph_inst.remove_nodes(stale_node_ids)
+        if entity_vdb is not None:
+            await entity_vdb.delete(
+                [compute_mdhash_id(node_id, prefix="ent-") for node_id in stale_node_ids]
+            )
+
     if not valid_edges:
         logger.warning(
             "Knowledge hierarchy skipped: root_id=%s has no valid hierarchy edges",
@@ -1301,14 +1616,31 @@ async def persist_resource_knowledge_hierarchy(
         )
         return False
 
-    nodes = [(hierarchy.root.entity_id, hierarchy.root.to_graph_data())]
+    nodes = [(node.entity_id, node.to_graph_data()) for node in node_by_id.values()]
     await knowledge_graph_inst.upsert_nodes_batch(nodes)
     await knowledge_graph_inst.upsert_edges_batch(valid_edges)
+
+    if entity_vdb is not None and hierarchy.nodes:
+        vector_payload = {}
+        for node in hierarchy.nodes:
+            aliases = ", ".join(node.aliases)
+            vector_payload[compute_mdhash_id(node.entity_id, prefix="ent-")] = {
+                # _get_node_data resolves graph nodes from entity_name. The
+                # display name remains in the graph metadata and vector text.
+                "entity_name": node.entity_id,
+                "entity_type": "knowledge_point",
+                "content": f"{node.entity_name}\n{node.description}\nAliases: {aliases}",
+                "source_id": node.source_id,
+                "file_path": node.file_path,
+                "root_id": node.root_id,
+                "node_type": "knowledge_point",
+            }
+        await entity_vdb.upsert(vector_payload)
 
     logger.info(
         "Persisted knowledge hierarchy: root_id=%s, nodes=%d, edges=%d",
         hierarchy.root.entity_id,
-        len(hierarchy.nodes) + 1,
+        len(nodes),
         len(valid_edges),
     )
     return True
@@ -1415,8 +1747,15 @@ async def build_chunk_results_from_resource_graph(
     return [(nodes, edges)]
 
 
-def _is_legacy_hierarchy_duplicate_id(node_id: str) -> bool:
-    return node_id.startswith("resource:") and ":kp:" in node_id
+def _is_legacy_hierarchy_duplicate(
+    node_id: str, node: dict[str, Any]
+) -> bool:
+    """Identify pre-v2 cloned nodes without removing current knowledge points."""
+    return (
+        node_id.startswith("resource:")
+        and ":kp:" in node_id
+        and node.get("node_type") != "knowledge_point"
+    )
 
 
 async def cleanup_legacy_hierarchy_duplicates(
@@ -1433,7 +1772,7 @@ async def cleanup_legacy_hierarchy_duplicates(
     legacy_ids: list[str] = []
     for node in nodes:
         node_id = str(node.get("entity_id") or node.get("id") or "")
-        if _is_legacy_hierarchy_duplicate_id(node_id):
+        if _is_legacy_hierarchy_duplicate(node_id, node):
             legacy_ids.append(node_id)
         elif (
             node.get("hierarchy_kind") == HIERARCHY_ROOT_KIND
@@ -1446,7 +1785,9 @@ async def cleanup_legacy_hierarchy_duplicates(
         await knowledge_graph_inst.delete_node(node_id)
 
     legacy_vdb_ids = [
-        node_id for node_id in legacy_ids if _is_legacy_hierarchy_duplicate_id(node_id)
+        compute_mdhash_id(node_id, prefix="ent-")
+        for node_id in legacy_ids
+        if node_id.startswith("resource:") and ":kp:" in node_id
     ]
     if entity_vdb is not None and legacy_vdb_ids:
         await entity_vdb.delete(legacy_vdb_ids)
@@ -1498,6 +1839,7 @@ async def _collect_children(
                 **child,
                 "root_id": root_id,
                 "parent_id": parent_id,
+                "parent_relation_type": edge_data.get("relation_type", "part_of"),
                 "file_path": child.get("file_path") or edge_data.get("file_path"),
                 "source_id": child.get("source_id") or edge_data.get("source_id", ""),
             }
@@ -1553,6 +1895,7 @@ async def _collect_hierarchy_children_by_root(
             **child,
             "root_id": root_id,
             "parent_id": parent_id,
+            "parent_relation_type": edge.get("relation_type", "part_of"),
             "file_path": child.get("file_path") or edge.get("file_path"),
             "source_id": child.get("source_id") or edge.get("source_id", ""),
         }
@@ -1672,17 +2015,29 @@ async def build_hierarchy_context(
             continue
         root_id = node.get("root_id")
 
+        expand_layer = max(0, int(getattr(query_param, "expand_layer", 0)))
+        parent_depth = (
+            expand_layer
+            if expand_layer
+            else int(getattr(query_param, "hierarchy_parent_depth", 2))
+        )
+        child_depth = (
+            expand_layer
+            if expand_layer
+            else int(getattr(query_param, "hierarchy_child_depth", 1))
+        )
+
         parent_chain = await _collect_parent_chain(
             knowledge_graph_inst,
             node,
-            int(getattr(query_param, "hierarchy_parent_depth", 2)),
+            parent_depth,
         )
         limit = int(getattr(query_param, "hierarchy_sibling_limit", 5))
         children = await _collect_descendants(
             knowledge_graph_inst,
             entity_id,
             root_id,
-            int(getattr(query_param, "hierarchy_child_depth", 1)),
+            child_depth,
             limit,
         )
         siblings = []
@@ -1694,6 +2049,10 @@ async def build_hierarchy_context(
                 for item in siblings
                 if item.get("entity_id") != node.get("entity_id")
             ][:limit]
+        associated_entities = await get_associated_entities(
+            knowledge_graph_inst,
+            str(entity_id),
+        )
 
         path = " -> ".join(
             [item.get("entity_name", item.get("entity_id", "")) for item in parent_chain]
@@ -1709,6 +2068,11 @@ async def build_hierarchy_context(
                     "Sibling Concepts: "
                     + ", ".join(
                         sibling.get("entity_name", "") for sibling in siblings
+                    ),
+                    "Associated Entities: "
+                    + ", ".join(
+                        f"{item.get('name', '')} ({item.get('relation', '')})"
+                        for item in associated_entities
                     ),
                     f"Source Chunks: {node.get('source_id', '')}",
                     f"File Path: {node.get('file_path', 'unknown_source')}",
@@ -1772,6 +2136,59 @@ async def get_hierarchy_tree(
         return payload
 
     return await build(root, 0)
+
+
+async def get_knowledge_point_subtree(
+    knowledge_graph_inst,
+    parent_id: str,
+    max_depth: int = 20,
+) -> dict[str, Any] | None:
+    """Return a knowledge-point subtree without exposing unrelated documents."""
+    parent = await _safe_get_node(knowledge_graph_inst, parent_id)
+    if not parent or parent.get("node_type") != "knowledge_point":
+        return None
+    root_id = str(parent.get("root_id") or "")
+    if not root_id:
+        return None
+    children_by_parent = await _collect_hierarchy_children_by_root(
+        knowledge_graph_inst, root_id
+    )
+
+    async def build(node: dict[str, Any], depth: int) -> dict[str, Any]:
+        payload = dict(node)
+        payload["children"] = []
+        if depth >= max_depth:
+            return payload
+        for child in sorted(
+            children_by_parent.get(str(node["entity_id"]), []),
+            key=lambda item: (
+                int(item.get("layer", item.get("level", 0))),
+                str(item.get("entity_name", item.get("entity_id", ""))),
+            ),
+        ):
+            payload["children"].append(await build(child, depth + 1))
+        return payload
+
+    return await build(parent, 0)
+
+
+async def get_associated_entities(
+    knowledge_graph_inst,
+    knowledge_point_id: str,
+) -> list[dict[str, str]]:
+    """Load the portable associated-entity property for one knowledge point."""
+    node = await _safe_get_node(knowledge_graph_inst, knowledge_point_id)
+    if not node or node.get("node_type") != "knowledge_point":
+        return []
+    raw_entities = node.get("associated_entities", "[]")
+    if isinstance(raw_entities, str):
+        try:
+            raw_entities = json.loads(raw_entities)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw_entities, list):
+        return []
+    return [item for item in raw_entities if isinstance(item, dict)]
 
 
 async def get_all_hierarchy_trees(

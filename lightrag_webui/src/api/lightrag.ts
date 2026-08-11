@@ -704,15 +704,16 @@ const hierarchyTreeToGraph = (root: LightragHierarchyNodeType): LightragGraphTyp
     })
 
     if (parentId) {
+      const relationType = String(node.parent_relation_type || 'part_of')
       edges.push({
-        id: `${parentId}-${nodeId}`,
-        source: parentId,
-        target: nodeId,
+        id: `${nodeId}-${parentId}`,
+        source: nodeId,
+        target: parentId,
         type: 'DIRECTED',
         properties: {
           edge_type: 'hierarchy',
-          relation_type: 'contains',
-          keywords: 'contains,hierarchy',
+          relation_type: relationType,
+          keywords: `${relationType},hierarchy`,
           weight: 1,
           root_id: root.entity_id,
           parent_id: parentId,

@@ -328,6 +328,60 @@ def create_graph_routes(workspace_dependency, api_key: Optional[str] = None):
                 detail=f"Error getting workspace hierarchies: {str(e)}",
             )
 
+    @router.get(
+        "/graph/knowledge-points/{knowledge_point_id}/subtree",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_knowledge_point_subtree(
+        knowledge_point_id: str,
+        max_depth: int = Query(20, description="Maximum hierarchy depth", ge=1, le=50),
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        try:
+            tree = await context.rag.get_knowledge_point_subtree(
+                parent_id=knowledge_point_id,
+                max_depth=max_depth,
+            )
+            if tree is None:
+                raise HTTPException(status_code=404, detail="Knowledge point not found")
+            return tree
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(
+                "Error getting knowledge point subtree for '%s': %s",
+                knowledge_point_id,
+                str(e),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error getting knowledge point subtree: {str(e)}",
+            )
+
+    @router.get(
+        "/graph/knowledge-points/{knowledge_point_id}/associated-entities",
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_knowledge_point_associated_entities(
+        knowledge_point_id: str,
+        context: WorkspaceContext = Depends(workspace_dependency),
+    ):
+        try:
+            items = await context.rag.get_knowledge_point_associated_entities(
+                knowledge_point_id
+            )
+            return {"items": items, "count": len(items)}
+        except Exception as e:
+            logger.error(
+                "Error getting associated entities for '%s': %s",
+                knowledge_point_id,
+                str(e),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error getting associated entities: {str(e)}",
+            )
+
     @router.post("/graph/hierarchy/retry", dependencies=[Depends(combined_auth)])
     async def retry_resource_hierarchy(
         request: HierarchyRetryRequest,

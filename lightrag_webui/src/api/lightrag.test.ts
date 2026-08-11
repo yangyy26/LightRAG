@@ -106,12 +106,14 @@ describe('queryGraphHierarchy', () => {
               entity_name: 'Tree',
               root_id: 'resource:doc-a',
               parent_id: 'resource:doc-a',
+              parent_relation_type: 'part_of',
               children: [
                 {
                   entity_id: 'Binary Tree',
                   entity_name: 'Binary Tree',
                   root_id: 'resource:doc-a',
                   parent_id: 'Tree',
+                  parent_relation_type: 'is_a',
                   children: []
                 }
               ]
@@ -130,10 +132,14 @@ describe('queryGraphHierarchy', () => {
       'Binary Tree'
     ])
     expect(graph.edges.map((edge) => [edge.source, edge.target])).toEqual([
-      ['resource:doc-a', 'Tree'],
-      ['Tree', 'Binary Tree']
+      ['Tree', 'resource:doc-a'],
+      ['Binary Tree', 'Tree']
     ])
     expect(graph.edges[0].properties.edge_type).toBe('hierarchy')
+    expect(graph.edges.map((edge) => edge.properties.relation_type)).toEqual([
+      'part_of',
+      'is_a'
+    ])
   })
 
   test('falls back to normal graph when hierarchy is not found', async () => {

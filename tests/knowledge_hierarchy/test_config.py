@@ -82,6 +82,12 @@ def test_query_param_hierarchy_defaults():
     assert param.max_hierarchy_tokens == 2000
 
 
+def test_query_param_accepts_shared_hierarchy_expand_layer():
+    param = QueryParam(expand_layer=3)
+
+    assert param.expand_layer == 3
+
+
 def test_entities_vector_storage_keeps_hierarchy_metadata():
     rag = make_rag()
 

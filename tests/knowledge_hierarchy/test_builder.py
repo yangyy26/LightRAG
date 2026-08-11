@@ -11,6 +11,7 @@ from lightrag.knowledge_hierarchy import (
     build_chunk_results_from_resource_graph,
     build_resource_knowledge_hierarchy,
     collect_hierarchy_candidates,
+    filter_bare_named_entity_candidates,
     filter_hierarchy_candidates_by_hard_rules,
     filter_hierarchy_candidates_by_grounding,
     normalize_assignments_to_hierarchy,
@@ -159,6 +160,87 @@ def test_hard_candidate_filter_keeps_cjk_single_character_concepts():
     assert set(filtered) == {"熵", "力"}
 
 
+def test_bare_named_entity_filter_keeps_explanatory_concepts_only():
+    candidates = collect_hierarchy_candidates(
+        [
+            (
+                {
+                    "贝卡利亚": [
+                        {
+                            "entity_name": "贝卡利亚",
+                            "entity_type": "person",
+                            "description": "A person.",
+                            "source_id": "chunk-a",
+                            "file_path": "law.pdf",
+                        }
+                    ],
+                    "贝卡利亚的刑罚思想": [
+                        {
+                            "entity_name": "贝卡利亚的刑罚思想",
+                            "entity_type": "person",
+                            "description": "A theory.",
+                            "source_id": "chunk-a",
+                            "file_path": "law.pdf",
+                        }
+                    ],
+                },
+                {},
+            )
+        ],
+        candidate_entity_types=[],
+        file_path="law.pdf",
+    )
+
+    filtered = filter_bare_named_entity_candidates(candidates)
+
+    assert set(filtered) == {"贝卡利亚的刑罚思想"}
+
+
+def test_bare_named_entity_filter_keeps_taxonomic_artifacts():
+    candidates = collect_hierarchy_candidates(
+        [
+            (
+                {
+                    "第一代集装箱船舶": [
+                        {
+                            "entity_name": "第一代集装箱船舶",
+                            "entity_type": "artifact",
+                            "description": "第一代远洋集装箱船。",
+                            "source_id": "chunk-a",
+                            "file_path": "ships.docx",
+                        }
+                    ],
+                    "艾玛·马士基号": [
+                        {
+                            "entity_name": "艾玛·马士基号",
+                            "entity_type": "artifact",
+                            "description": "一艘具体船舶。",
+                            "source_id": "chunk-a",
+                            "file_path": "ships.docx",
+                        }
+                    ],
+                    "TEU": [
+                        {
+                            "entity_name": "TEU",
+                            "entity_type": "data",
+                            "description": "标准箱计量单位。",
+                            "source_id": "chunk-a",
+                            "file_path": "ships.docx",
+                        }
+                    ],
+                },
+                {},
+            )
+        ],
+        candidate_entity_types=[],
+        file_path="ships.docx",
+    )
+
+    filtered = filter_bare_named_entity_candidates(candidates)
+
+    assert set(filtered) == {"第一代集装箱船舶"}
+
+
 @pytest.mark.asyncio
 async def test_resource_graph_chunk_results_trim_merged_node_to_current_doc_chunks():
     class FakeGraph:
@@ -295,11 +377,12 @@ def test_normalize_assignments_covers_all_candidates_and_roots_unassigned():
         min_confidence=0.6,
     )
 
+    nodes_by_name = {node.entity_name: node for node in hierarchy.nodes}
     edge_pairs = {(src, tgt) for src, tgt, _data in hierarchy.edges}
     assert edge_pairs == {
-        ("resource:doc-a", "Parent"),
-        ("Parent", "Child"),
-        ("resource:doc-a", "Orphan"),
+        (nodes_by_name["Parent"].entity_id, "resource:doc-a"),
+        (nodes_by_name["Child"].entity_id, nodes_by_name["Parent"].entity_id),
+        (nodes_by_name["Orphan"].entity_id, "resource:doc-a"),
     }
 
 
@@ -323,8 +406,7 @@ def test_normalize_assignments_removes_semantically_rejected_candidates():
         min_confidence=0.6,
     )
 
-    edge_children = {target for _source, target, _data in hierarchy.edges}
-    assert edge_children == {"二叉树"}
+    assert [node.entity_name for node in hierarchy.nodes] == ["二叉树"]
 
 
 def test_normalize_assignments_keeps_all_candidates_when_filter_rejects_everything():
@@ -358,10 +440,9 @@ def test_normalize_assignments_keeps_all_candidates_when_filter_rejects_everythi
         min_confidence=0.6,
     )
 
-    edge_children = {target for _source, target, _data in hierarchy.edges}
-    assert edge_children == {"邻补角", "补角"}
+    assert {node.entity_name for node in hierarchy.nodes} == {"邻补角", "补角"}
     # All fall back to root-level attachment.
-    assert all(source == "resource:doc-a" for source, _target, _data in hierarchy.edges)
+    assert all(node.parent_id == "resource:doc-a" for node in hierarchy.nodes)
 
 
 def test_normalize_assignments_keeps_missing_decision_as_root_candidate():
@@ -383,7 +464,7 @@ def test_normalize_assignments_keeps_missing_decision_as_root_candidate():
     )
 
     assert len(hierarchy.edges) == 1
-    assert hierarchy.edges[0][1] == "二叉树"
+    assert hierarchy.edges[0][1] == "resource:doc-a"
 
 
 def test_normalize_assignments_treats_root_decision_with_parent_as_root():
@@ -405,8 +486,9 @@ def test_normalize_assignments_treats_root_decision_with_parent_as_root():
         min_confidence=0.6,
     )
 
-    edge_by_child = {target: source for source, target, _data in hierarchy.edges}
-    assert edge_by_child["Child"] == "resource:doc-a"
+    child = next(node for node in hierarchy.nodes if node.entity_name == "Child")
+    assert hierarchy.edges[0][1] == "resource:doc-a"
+    assert child.parent_id == "resource:doc-a"
 
 
 def test_parent_assignment_prompt_includes_reject_decisions():
@@ -439,8 +521,10 @@ def test_parent_assignment_prompt_includes_reject_decisions():
             "parent": None,
             "confidence": 0.99,
             "decision": "reject",
+            "canonical_name": None,
         }
     ]
+    assert "generation, version, or model" in prompt
 
 
 def test_normalize_assignments_rejects_cycles_and_low_confidence():
@@ -460,10 +544,17 @@ def test_normalize_assignments_rejects_cycles_and_low_confidence():
         min_confidence=0.6,
     )
 
+    nodes_by_name = {node.entity_name: node for node in hierarchy.nodes}
     edge_pairs = {(src, tgt) for src, tgt, _data in hierarchy.edges}
-    assert ("A", "B") not in edge_pairs or ("B", "A") not in edge_pairs
-    assert ("resource:doc-a", "C") in edge_pairs
-    assert {tgt for _src, tgt, _data in hierarchy.edges} == {"A", "B", "C"}
+    assert (
+        nodes_by_name["A"].entity_id,
+        nodes_by_name["B"].entity_id,
+    ) not in edge_pairs or (
+        nodes_by_name["B"].entity_id,
+        nodes_by_name["A"].entity_id,
+    ) not in edge_pairs
+    assert (nodes_by_name["C"].entity_id, "resource:doc-a") in edge_pairs
+    assert {node.entity_name for node in hierarchy.nodes} == {"A", "B", "C"}
 
 
 def test_normalize_assignments_rejects_parent_child_compound_sibling_conflict():
@@ -481,9 +572,104 @@ def test_normalize_assignments_rejects_parent_child_compound_sibling_conflict():
         min_confidence=0.6,
     )
 
-    edge_pairs = {(src, tgt) for src, tgt, _data in hierarchy.edges}
-    assert ("Country", "Constitution") not in edge_pairs
-    assert ("resource:doc-a", "Constitution") in edge_pairs
+    constitution = next(node for node in hierarchy.nodes if node.entity_name == "Constitution")
+    assert constitution.parent_id == "resource:doc-a"
+
+
+def test_knowledge_point_tree_rejects_entities_merges_aliases_and_keeps_part_of_siblings():
+    candidates = _candidate_map(
+        "行刑原则",
+        "行刑效率原则",
+        "行刑安全原则",
+        "行刑人道原则",
+        "贝卡利亚",
+        "贝卡利亚的刑罚思想",
+        "罪刑法定",
+        "罪刑法定原则",
+    )
+
+
+def _knowledge_point_parents(hierarchy):
+    names = {
+        hierarchy.root.entity_id: hierarchy.root.entity_id,
+        **{node.entity_id: node.entity_name for node in hierarchy.nodes},
+    }
+    return {
+        names[data["child_id"]]: names[data["parent_id"]]
+        for _src, _tgt, data in hierarchy.edges
+        if data.get("edge_type") == "hierarchy"
+    }
+
+    hierarchy = normalize_assignments_to_hierarchy(
+        root_id="resource:criminal-law",
+        root_title="criminal-law.pdf",
+        file_path="criminal-law.pdf",
+        candidates=candidates,
+        assignments=[
+            ParentAssignment(child="行刑原则", parent=None, confidence=0.99, decision="root"),
+            ParentAssignment(
+                child="行刑效率原则",
+                parent="行刑原则",
+                confidence=0.99,
+                relation_to_parent="part_of",
+            ),
+            ParentAssignment(
+                child="行刑安全原则",
+                parent="行刑原则",
+                confidence=0.99,
+                relation_to_parent="part_of",
+            ),
+            ParentAssignment(
+                child="行刑人道原则",
+                parent="行刑原则",
+                confidence=0.99,
+                relation_to_parent="part_of",
+            ),
+            ParentAssignment(child="贝卡利亚", parent=None, confidence=0.99, decision="reject"),
+            ParentAssignment(
+                child="贝卡利亚的刑罚思想",
+                parent=None,
+                confidence=0.99,
+                decision="root",
+                associated_entities=[
+                    {"name": "贝卡利亚", "type": "person", "relation": "proposed_by"}
+                ],
+            ),
+            ParentAssignment(
+                child="罪刑法定",
+                parent=None,
+                confidence=0.99,
+                decision="root",
+                canonical_name="罪刑法定原则",
+            ),
+            ParentAssignment(child="罪刑法定原则", parent=None, confidence=0.99, decision="root"),
+        ],
+        max_depth=5,
+        min_confidence=0.6,
+    )
+
+    nodes_by_name = {node.entity_name: node for node in hierarchy.nodes}
+    assert "贝卡利亚" not in nodes_by_name
+    assert set(nodes_by_name) == {
+        "行刑原则",
+        "行刑效率原则",
+        "行刑安全原则",
+        "行刑人道原则",
+        "贝卡利亚的刑罚思想",
+        "罪刑法定原则",
+    }
+    parent = nodes_by_name["行刑原则"]
+    for name in ("行刑效率原则", "行刑安全原则", "行刑人道原则"):
+        node = nodes_by_name[name]
+        assert node.parent_id == parent.entity_id
+        assert node.level == 2
+    assert nodes_by_name["罪刑法定原则"].aliases == ["罪刑法定原则", "罪刑法定"]
+    assert nodes_by_name["贝卡利亚的刑罚思想"].associated_entities == [
+        {"name": "贝卡利亚", "type": "person", "relation": "proposed_by"}
+    ]
+    hierarchy_edges = [edge for edge in hierarchy.edges if edge[2]["edge_type"] == "hierarchy"]
+    assert all(edge[2]["child_id"] == edge[0] for edge in hierarchy_edges)
+    assert all(edge[2]["relation_type"] in {"is_a", "part_of"} for edge in hierarchy_edges)
 
 
 def test_assign_parents_from_relations_prefers_hierarchy_keywords():
@@ -971,10 +1157,8 @@ async def test_build_resource_knowledge_hierarchy_calls_llm_and_normalizes_json(
 
     assert hierarchy is not None
     assert hierarchy.root.entity_id == "resource:doc-a"
-    assert hierarchy.nodes == []
-    assert ("Tree", "Binary Tree") in [
-        (src, tgt) for src, tgt, _data in hierarchy.edges
-    ]
+    assert {node.entity_name for node in hierarchy.nodes} == {"Tree", "Binary Tree"}
+    assert _knowledge_point_parents(hierarchy)["Binary Tree"] == "Tree"
 
 
 @pytest.mark.asyncio
@@ -1027,8 +1211,8 @@ async def test_build_resource_knowledge_hierarchy_falls_back_when_grounding_stri
     )
 
     assert hierarchy is not None
-    edge_children = {tgt for _src, tgt, _data in hierarchy.edges}
-    assert edge_children == {"作物育种"}
+    assert [node.entity_name for node in hierarchy.nodes] == ["作物育种"]
+    assert hierarchy.nodes[0].parent_id == "resource:doc-breeding"
 
 
 @pytest.mark.asyncio
@@ -1094,7 +1278,10 @@ async def test_build_resource_knowledge_hierarchy_keeps_low_frequency_candidates
     )
 
     assert hierarchy is not None
-    assert {target for _source, target, _data in hierarchy.edges} == {"二叉树", "红黑树"}
+    assert _knowledge_point_parents(hierarchy) == {
+        "二叉树": "resource:doc-a",
+        "红黑树": "resource:doc-a",
+    }
 
 
 @pytest.mark.asyncio
@@ -1147,7 +1334,7 @@ async def test_build_resource_knowledge_hierarchy_applies_hard_filter_before_llm
 
     assert hierarchy is not None
     assert "课时01" not in captured_prompts[0]
-    assert {target for _source, target, _data in hierarchy.edges} == {"二叉树"}
+    assert _knowledge_point_parents(hierarchy) == {"二叉树": "resource:doc-a"}
 
 
 @pytest.mark.asyncio
@@ -1269,15 +1456,12 @@ async def test_build_resource_knowledge_hierarchy_repairs_mostly_flat_llm_tree_f
     )
 
     assert hierarchy is not None
-    root_edges = [
-        (src, tgt) for src, tgt, _data in hierarchy.edges if src == "resource:doc-large"
-    ]
-    non_root_edges = [
-        (src, tgt) for src, tgt, _data in hierarchy.edges if src != "resource:doc-large"
-    ]
+    parents = _knowledge_point_parents(hierarchy)
+    root_edges = [name for name, parent in parents.items() if parent == "resource:doc-large"]
+    non_root_edges = [name for name, parent in parents.items() if parent != "resource:doc-large"]
     assert len(non_root_edges) >= 20
     assert len(root_edges) <= 62
-    assert ("Concept 0", "Concept 1") in non_root_edges
+    assert parents["Concept 1"] == "Concept 0"
 
 
 @pytest.mark.asyncio
@@ -1322,9 +1506,8 @@ async def test_build_resource_knowledge_hierarchy_roots_all_candidates_on_llm_fa
     )
 
     assert hierarchy is not None
-    edge_pairs = {(src, tgt) for src, tgt, _data in hierarchy.edges}
     assert len(hierarchy.edges) == 12
-    assert ("Concept 0", "Concept 1") in edge_pairs
+    assert _knowledge_point_parents(hierarchy)["Concept 1"] == "Concept 0"
 
 
 @pytest.mark.asyncio
@@ -1387,13 +1570,11 @@ async def test_build_resource_knowledge_hierarchy_batches_all_candidates():
     )
 
     assert hierarchy is not None
-    edge_pairs = {(src, tgt) for src, tgt, _data in hierarchy.edges}
-    assert {tgt for _src, tgt, _data in hierarchy.edges} == {
-        f"Concept {idx}" for idx in range(5)
-    }
-    assert ("Concept 0", "Concept 1") in edge_pairs
-    assert ("Concept 2", "Concept 3") in edge_pairs
-    assert ("resource:doc-a", "Concept 4") in edge_pairs
+    parents = _knowledge_point_parents(hierarchy)
+    assert set(parents) == {f"Concept {idx}" for idx in range(5)}
+    assert parents["Concept 1"] == "Concept 0"
+    assert parents["Concept 3"] == "Concept 2"
+    assert parents["Concept 4"] == "resource:doc-a"
     assert any("Parent Assignment JSON" in prompt for prompt in prompts)
 
 
@@ -1475,8 +1656,7 @@ async def test_build_resource_knowledge_hierarchy_does_not_retry_rejected_candid
     )
 
     assert hierarchy is not None
-    edge_children = {target for _source, target, _data in hierarchy.edges}
-    assert edge_children == {"树", "二叉树"}
+    assert set(_knowledge_point_parents(hierarchy)) == {"树", "二叉树"}
     assert len(prompts) == 2
 
     second_unresolved_json = prompts[1].split("Unresolved Children JSON:\n", 1)[
@@ -1541,8 +1721,7 @@ async def test_build_resource_knowledge_hierarchy_ignores_reject_when_semantic_f
     assert len(prompts) == 1
     assert '"reject"' not in prompts[0]
     assert len(hierarchy.edges) == 1
-    assert hierarchy.edges[0][0] == "resource:doc-a"
-    assert hierarchy.edges[0][1] == "课时01"
+    assert _knowledge_point_parents(hierarchy) == {"课时01": "resource:doc-a"}
 
 
 @pytest.mark.asyncio
@@ -1627,8 +1806,7 @@ async def test_build_resource_knowledge_hierarchy_counts_reject_as_round_progres
     )
 
     assert hierarchy is not None
-    edge_children = {target for _source, target, _data in hierarchy.edges}
-    assert edge_children == {"树", "二叉树"}
+    assert set(_knowledge_point_parents(hierarchy)) == {"树", "二叉树"}
     assert len(prompts) == 2
 
     second_unresolved_json = prompts[1].split("Unresolved Children JSON:\n", 1)[
@@ -1784,16 +1962,11 @@ async def test_build_resource_knowledge_hierarchy_roots_failed_batch_children():
     )
 
     assert hierarchy is not None
-    edge_pairs = {(src, tgt) for src, tgt, _data in hierarchy.edges}
-    assert {tgt for _src, tgt, _data in hierarchy.edges} == {
-        "Concept 0",
-        "Concept 1",
-        "Concept 2",
-        "Concept 3",
-    }
-    assert ("Concept 2", "Concept 3") in edge_pairs
-    assert ("resource:doc-a", "Concept 0") in edge_pairs
-    assert ("resource:doc-a", "Concept 1") in edge_pairs
+    parents = _knowledge_point_parents(hierarchy)
+    assert set(parents) == {f"Concept {idx}" for idx in range(4)}
+    assert parents["Concept 3"] == "Concept 2"
+    assert parents["Concept 0"] == "resource:doc-a"
+    assert parents["Concept 1"] == "resource:doc-a"
 
 
 @pytest.mark.asyncio

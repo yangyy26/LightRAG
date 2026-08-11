@@ -86,6 +86,12 @@ class QueryRequest(BaseModel):
         ge=0,
         le=10,
     )
+    expand_layer: Optional[int] = Field(
+        default=None,
+        description="Shared ancestor and descendant depth for hierarchy context expansion.",
+        ge=0,
+        le=10,
+    )
     hierarchy_sibling_limit: Optional[int] = Field(
         default=None,
         description="Maximum sibling concepts included per matched hierarchy node.",
