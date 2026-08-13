@@ -43,9 +43,27 @@ async def send_hierarchy_callback(callback_url: str, doc_id: str) -> bool:
                     params={"doc_id": doc_id},
                 )
                 if 200 <= response.status_code < 300:
+                    logger.info(
+                        "Hierarchy callback succeeded: url=%s doc_id=%s "
+                        "status_code=%d response=%s",
+                        callback_url,
+                        doc_id,
+                        response.status_code,
+                        response.text[:500],
+                    )
                     return True
                 last_error = (
                     f"HTTP {response.status_code}: {response.text[:200]}"
+                )
+                logger.warning(
+                    "Hierarchy callback returned non-2xx: url=%s doc_id=%s "
+                    "status_code=%d response=%s (attempt %d/%d)",
+                    callback_url,
+                    doc_id,
+                    response.status_code,
+                    response.text[:500],
+                    attempt + 1,
+                    _CALLBACK_MAX_RETRIES + 1,
                 )
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             last_error = str(exc)

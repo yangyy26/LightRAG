@@ -2074,6 +2074,16 @@ async def pipeline_enqueue_file(
         api_process_options = process_options or PROCESS_OPTION_CHUNK_FIXED
         if skip_hierarchy:
             api_process_options += PROCESS_OPTION_SKIP_HIERARCHY
+
+        # Compute the doc id from the ORIGINAL uploaded filename so that it stays
+        # consistent with the doc id returned by the /upload endpoint, even when the
+        # file is later replaced by an office-converted artifact (e.g. .ppt -> .pptx,
+        # .xls -> .xlsx, or a converted .pdf/.docx). The legacy content-parsing path
+        # below enqueues without passing ids, which would otherwise recompute the id
+        # from the converted file name and diverge from the upload doc id.
+        doc_doc_id = compute_mdhash_id(
+            normalize_file_path(str(file_path)), prefix="doc-"
+        )
         if ext in _LEGACY_OFFICE_EXTENSIONS:
             conv_info = _LEGACY_OFFICE_CONVERSION_MAP[ext]
             _, _, out_suffix = conv_info
@@ -2474,6 +2484,7 @@ async def pipeline_enqueue_file(
             try:
                 enqueue_kwargs = {
                     "file_paths": file_path.name,
+                    "ids": [doc_doc_id],
                     "track_id": track_id,
                     "parse_engine": PARSER_ENGINE_LEGACY,
                     "process_options": api_process_options,
