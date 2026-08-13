@@ -136,6 +136,63 @@ def test_candidate_grounding_filters_names_absent_from_current_document():
     assert set(filtered) == {"verified resource title: norms, theory, and values"}
 
 
+def test_candidate_grounding_defers_ungrounded_semantic_candidates_to_classification():
+    candidates = collect_hierarchy_candidates(
+        [
+            (
+                {
+                    "太空诱变育种": [
+                        {
+                            "entity_name": "太空诱变育种",
+                            "entity_type": "method",
+                            "description": "A breeding method.",
+                            "source_id": "chunk-a",
+                            "file_path": "breeding.pdf",
+                        }
+                    ],
+                    "纹枯病抗性": [
+                        {
+                            "entity_name": "纹枯病抗性",
+                            "entity_type": "concept",
+                            "description": "Resistance to sheath blight.",
+                            "source_id": "chunk-a",
+                            "file_path": "breeding.pdf",
+                        }
+                    ],
+                    "SP3596材料": [
+                        {
+                            "entity_name": "SP3596材料",
+                            "entity_type": "data",
+                            "description": "A selected breeding material.",
+                            "source_id": "chunk-a",
+                            "file_path": "breeding.pdf",
+                        }
+                    ],
+                    "虚构教学资源标题": [
+                        {
+                            "entity_name": "虚构教学资源标题",
+                            "entity_type": "content",
+                            "description": "An ungrounded title.",
+                            "source_id": "chunk-a",
+                            "file_path": "breeding.pdf",
+                        }
+                    ],
+                },
+                {},
+            )
+        ],
+        candidate_entity_types=[],
+        file_path="breeding.pdf",
+    )
+
+    filtered = filter_hierarchy_candidates_by_grounding(
+        candidates,
+        "种子通过太空诱变处理后，SP3材料表现出较耐纹枯病的特性。",
+    )
+
+    assert set(filtered) == {"太空诱变育种", "纹枯病抗性", "sp3596材料"}
+
+
 def test_hard_candidate_filter_removes_obvious_non_knowledge_names():
     candidates = _candidate_map("课时01", "2017年1月3日", "2024-01-03", "123")
 
@@ -196,7 +253,7 @@ def test_bare_named_entity_filter_keeps_explanatory_concepts_only():
     assert set(filtered) == {"贝卡利亚的刑罚思想"}
 
 
-def test_bare_named_entity_filter_keeps_taxonomic_artifacts():
+def test_bare_named_entity_filter_defers_contextual_entity_types_to_semantic_classification():
     candidates = collect_hierarchy_candidates(
         [
             (
@@ -228,6 +285,15 @@ def test_bare_named_entity_filter_keeps_taxonomic_artifacts():
                             "file_path": "ships.docx",
                         }
                     ],
+                    "航运集团": [
+                        {
+                            "entity_name": "航运集团",
+                            "entity_type": "organization",
+                            "description": "一家航运企业。",
+                            "source_id": "chunk-a",
+                            "file_path": "ships.docx",
+                        }
+                    ],
                 },
                 {},
             )
@@ -238,7 +304,7 @@ def test_bare_named_entity_filter_keeps_taxonomic_artifacts():
 
     filtered = filter_bare_named_entity_candidates(candidates)
 
-    assert set(filtered) == {"第一代集装箱船舶"}
+    assert set(filtered) == {"第一代集装箱船舶", "艾玛·马士基号", "teu"}
 
 
 @pytest.mark.asyncio
@@ -1213,6 +1279,66 @@ async def test_build_resource_knowledge_hierarchy_falls_back_when_grounding_stri
     assert hierarchy is not None
     assert [node.entity_name for node in hierarchy.nodes] == ["作物育种"]
     assert hierarchy.nodes[0].parent_id == "resource:doc-breeding"
+
+
+@pytest.mark.asyncio
+async def test_build_resource_knowledge_hierarchy_keeps_all_bare_entity_candidates_for_semantic_classification():
+    """Crop varieties may be extracted as artifacts but remain knowledge points."""
+
+    async def fake_llm(prompt: str, **_kwargs):
+        assert "郑麦3596" in prompt
+        return {
+            "assignments": [
+                {
+                    "child": "郑麦3596",
+                    "parent": None,
+                    "confidence": 0.9,
+                    "decision": "root",
+                    "reason": "A crop variety discussed and characterized by this resource.",
+                }
+            ]
+        }
+
+    chunk_results = [
+        (
+            {
+                "郑麦3596": [
+                    {
+                        "entity_name": "郑麦3596",
+                        "entity_type": "artifact",
+                        "description": "A wheat variety selected through space-induced mutation breeding.",
+                        "source_id": "chunk-a",
+                        "file_path": "小麦诱变育种：郑麦3596选育.pdf",
+                    }
+                ]
+            },
+            {},
+        )
+    ]
+
+    candidates = collect_hierarchy_candidates(
+        chunk_results,
+        candidate_entity_types=[],
+        file_path="小麦诱变育种：郑麦3596选育.pdf",
+    )
+    assert set(filter_bare_named_entity_candidates(candidates)) == {"郑麦3596"}
+
+    hierarchy = await build_resource_knowledge_hierarchy(
+        doc_id="doc-zhengmai-3596",
+        file_path="小麦诱变育种：郑麦3596选育.pdf",
+        chunk_results=chunk_results,
+        global_config={
+            "enable_knowledge_hierarchy": True,
+            "hierarchy_candidate_entity_types": [],
+            "llm_model_func": fake_llm,
+        },
+        grounding_text="郑麦3596是通过诱变育种选育的小麦新品种。",
+    )
+
+    assert hierarchy is not None
+    assert _knowledge_point_parents(hierarchy) == {
+        "郑麦3596": "resource:doc-zhengmai-3596"
+    }
 
 
 @pytest.mark.asyncio

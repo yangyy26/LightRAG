@@ -220,6 +220,17 @@ def _candidate_name_is_grounded(name: str, grounding_text: str) -> bool:
     return matched == len(parts)
 
 
+_SEMANTIC_GROUNDING_FALLBACK_ENTITY_TYPES = {
+    "artifact",
+    "concept",
+    "creature",
+    "data",
+    "knowledgepoint",
+    "method",
+    "naturalobject",
+}
+
+
 def filter_hierarchy_candidates_by_grounding(
     candidates: dict[str, HierarchyCandidate],
     grounding_text: str,
@@ -231,6 +242,8 @@ def filter_hierarchy_candidates_by_grounding(
         key: candidate
         for key, candidate in candidates.items()
         if _candidate_name_is_grounded(candidate.name, grounding_text)
+        or candidate.entity_type.lower()
+        in _SEMANTIC_GROUNDING_FALLBACK_ENTITY_TYPES
     }
     removed = len(candidates) - len(filtered)
     if removed:
@@ -238,6 +251,16 @@ def filter_hierarchy_candidates_by_grounding(
             "Filtered ungrounded hierarchy candidates: kept=%d, removed=%d",
             len(filtered),
             removed,
+        )
+    deferred = sum(
+        1
+        for candidate in filtered.values()
+        if not _candidate_name_is_grounded(candidate.name, grounding_text)
+    )
+    if deferred:
+        logger.info(
+            "Deferred ungrounded semantic hierarchy candidates to classification: count=%d",
+            deferred,
         )
     return filtered
 
@@ -296,11 +319,6 @@ _BARE_ENTITY_TYPES = {
     "person",
     "organization",
     "location",
-    "content",
-    "artifact",
-    "naturalobject",
-    "creature",
-    "data",
 }
 
 _TAXONOMIC_ARTIFACT_RE = re.compile(
@@ -1125,8 +1143,11 @@ def _build_parent_assignment_prompt(
             "non-concept labels. A phrase such as a person's named theory is a valid "
             "knowledge point when it can be defined. A domain-specific category, "
             "type, generation, version, or model is also a valid knowledge point "
-            "when its description defines it or places it in a taxonomy, even when "
-            "its extracted entity type is Artifact or Content.\n"
+            "when its description defines it or places it in a taxonomy. Named "
+            "cultivars, breeds, experimental materials or stages, and named "
+            "procedures or trials are also valid knowledge points when the document "
+            "explains their role or properties; do not reject them only because they "
+            "are extracted as Artifact, Content, Data, or contain an identifier.\n"
             'Use decision="root" when the child is a valid knowledge point but has '
             "no clear parent.\n"
         )
@@ -1359,7 +1380,18 @@ async def build_resource_knowledge_hierarchy(
         )
     if bool(global_config.get("hierarchy_enable_hard_candidate_filter", True)):
         candidates = filter_hierarchy_candidates_by_hard_rules(candidates)
-    candidates = filter_bare_named_entity_candidates(candidates)
+    bare_entity_filtered_candidates = filter_bare_named_entity_candidates(candidates)
+    if bare_entity_filtered_candidates or not candidates:
+        candidates = bare_entity_filtered_candidates
+    else:
+        # Entity extraction can classify all meaningful candidates in a
+        # resource as Artifact, Content, or Organization. Do not let that
+        # coarse type signal erase the entire hierarchy; the semantic
+        # classifier can make the final per-candidate decision.
+        logger.warning(
+            "Bare named-entity filter removed every hierarchy candidate for `%s`; retaining candidates for semantic classification",
+            file_path,
+        )
     if not candidates:
         logger.info(
             "No hierarchy candidates found for `%s` (candidate_entity_types=%s)",
